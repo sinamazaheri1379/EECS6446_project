@@ -1,0 +1,74 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cartservice-elascale
+  namespace: default
+  labels:
+    optimization: elascale
+    service: cartservice
+  annotations:
+    description: "Elascale-optimized HPA for cartservice with multi-factor formula"
+    formula: "f = 0.3Â·CPU + 0.4Â·MEM + 0.1Â·NET + 0.2Â·REP"
+    replication-factor: "3:1 ratio with redis-cart (1 Redis per 3 cart instances)"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cartservice
+  
+  # Higher minimum for availability (Elascale principle)
+  minReplicas: 2
+  maxReplicas: 15
+  
+  metrics:
+  # CPU Utilization (Î± = 0.3)
+  # Cartservice is moderately CPU intensive due to Redis interactions
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60  # Scale up when CPU > 60%
+  
+  # Memory Utilization (Î² = 0.4 - HIGHEST WEIGHT)
+  # Higher weight due to cart data caching requirements
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 65  # Scale up when Memory > 65%
+  
+  # Network utilization would be Î³ = 0.1 (lightweight protocol)
+  # Note: Requires custom metrics adapter for network metrics
+  # This is commented out but represents the concept from Elascale paper
+  
+  # Replication factor Î» = 0.2 is implicit in the behavior policies below
+  # Maintains 3:1 ratio with Redis instances
+  
+  behavior:
+    scaleUp:
+      # Fast scale-up to combat contribution time (Elascale Section 4.2)
+      stabilizationWindowSeconds: 30  # React quickly (vs 60s default)
+      policies:
+      # Aggressive scale-up to handle contribution time
+      # Based on Elascale finding: contribution time >> provisioning time
+      - type: Pods
+        value: 3  # Add 3 pods at once (not 1!)
+        periodSeconds: 30
+      - type: Percent
+        value: 50  # Or 50% of current pods
+        periodSeconds: 30
+      selectPolicy: Max  # Choose most aggressive policy
+    
+    scaleDown:
+      # Conservative scale-down to maintain service dependencies
+      stabilizationWindowSeconds: 300  # 5 min stabilization (prevent flapping)
+      policies:
+      - type: Pods
+        value: 1  # Remove only 1 pod at a time
+        periodSeconds: 120
+      - type: Percent
+        value: 10  # Maximum 10% reduction at a time
+        periodSeconds: 120
+      selectPolicy: Min  # Choose most conservative policy
