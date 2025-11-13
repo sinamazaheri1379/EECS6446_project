@@ -58,11 +58,11 @@ echo -e "${GREEN}âœ“ Python dependencies installed${NC}"
 # ============================================================
 echo -e "\n${YELLOW}[Step 3/7] Creating Directory Structure...${NC}"
 
-mkdir -p /home/claude/optimizations/results
-mkdir -p /home/claude/optimizations/monitoring
-mkdir -p /home/claude/optimizations/scaling
-mkdir -p /home/claude/optimizations/scripts
-mkdir -p /home/claude/optimizations/analysis
+mkdir -p /home/EECS6446_project/files/optimizations/results
+mkdir -p /home/EECS6446_project/files/optimizations/monitoring
+mkdir -p /home/EECS6446_project/files/optimizations/scaling
+mkdir -p /home/EECS6446_project/files/optimizations/scripts
+mkdir -p /home/EECS6446_project/files/optimizations/analysis
 
 echo -e "${GREEN}âœ“ Directory structure created${NC}"
 
