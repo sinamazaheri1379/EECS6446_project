@@ -1,0 +1,229 @@
+---
+# Frontend Service HPA
+# Formula: f = 0.4Â·CPU + 0.3Â·MEM + 0.3Â·NET + 0.0Â·REP
+# User-facing service with high CPU and network requirements
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-elascale
+  namespace: default
+  labels:
+    optimization: elascale
+    service: frontend
+  annotations:
+    description: "User-facing service with CPU + network intensive workload"
+    formula: "f = 0.4Â·CPU + 0.3Â·MEM + 0.3Â·NET"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 55  # Î± = 0.4 (highest weight for CPU)
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70  # Î² = 0.3
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 20
+      policies:
+      - type: Pods
+        value: 4  # Add 4 pods at once (user-facing)
+        periodSeconds: 20
+      - type: Percent
+        value: 100  # Or double current capacity
+        periodSeconds: 20
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 180
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120
+      - type: Percent
+        value: 10
+        periodSeconds: 120
+      selectPolicy: Min
+
+---
+# Checkout Service HPA
+# Formula: f = 0.5Â·CPU + 0.3Â·MEM + 0.0Â·NET + 0.2Â·REP
+# CPU-intensive business logic service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkoutservice-elascale
+  namespace: default
+  labels:
+    optimization: elascale
+    service: checkoutservice
+  annotations:
+    description: "CPU-intensive business logic with frontend dependency"
+    formula: "f = 0.5Â·CPU + 0.3Â·MEM + 0.2Â·REP"
+    replication-factor: "2:1 ratio with frontend"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkoutservice
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60  # Î± = 0.5 (CPU dominant)
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70  # Î² = 0.3
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Pods
+        value: 3
+        periodSeconds: 30
+      - type: Percent
+        value: 50
+        periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 240
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120
+      - type: Percent
+        value: 10
+        periodSeconds: 120
+      selectPolicy: Min
+
+---
+# Product Catalog Service HPA
+# Formula: f = 0.3Â·CPU + 0.5Â·MEM + 0.0Â·NET + 0.2Â·REP
+# Memory-intensive catalog caching service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: productcatalogservice-elascale
+  namespace: default
+  labels:
+    optimization: elascale
+    service: productcatalogservice
+  annotations:
+    description: "Memory-intensive catalog caching service"
+    formula: "f = 0.3Â·CPU + 0.5Â·MEM + 0.2Â·REP"
+    replication-factor: "2:1 ratio with checkoutservice"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: productcatalogservice
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 65
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70  # Î² = 0.5 (Memory dominant)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 45
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 45
+      - type: Percent
+        value: 50
+        periodSeconds: 45
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 150
+      - type: Percent
+        value: 10
+        periodSeconds: 150
+      selectPolicy: Min
+
+---
+# Recommendation Service HPA
+# Formula: f = 0.6Â·CPU + 0.4Â·MEM + 0.0Â·NET + 0.0Â·REP
+# Very CPU-intensive ML/recommendation service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendationservice-elascale
+  namespace: default
+  labels:
+    optimization: elascale
+    service: recommendationservice
+  annotations:
+    description: "Very CPU-intensive ML recommendation engine"
+    formula: "f = 0.6Â·CPU + 0.4Â·MEM"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendationservice
+  minReplicas: 1
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 65  # Î± = 0.6 (Very CPU intensive)
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 75  # Î² = 0.4
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 30
+      - type: Percent
+        value: 100  # Can double for ML workloads
+        periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 180
+      - type: Percent
+        value: 10
+        periodSeconds: 180
+      selectPolicy: Min
