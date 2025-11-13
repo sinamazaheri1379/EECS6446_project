@@ -58,11 +58,11 @@ echo -e "${GREEN}âœ“ Python dependencies installed${NC}"
 # ============================================================
 echo -e "\n${YELLOW}[Step 3/7] Creating Directory Structure...${NC}"
 
-mkdir -p /home/EECS6446_project/files/optimizations/results
-mkdir -p /home/EECS6446_project/files/optimizations/monitoring
-mkdir -p /home/EECS6446_project/files/optimizations/scaling
-mkdir -p /home/EECS6446_project/files/optimizations/scripts
-mkdir -p /home/EECS6446_project/files/optimizations/analysis
+mkdir -p /home/common/EECS6446_project/files/optimizations/results
+mkdir -p /home/common/EECS6446_project/files/optimizations/monitoring
+mkdir -p /home/common/EECS6446_project/files/optimizations/scaling
+mkdir -p /home/common/EECS6446_project/files/optimizations/scripts
+mkdir -p /home/common/EECS6446_project/files/optimizations/analysis
 
 echo -e "${GREEN}âœ“ Directory structure created${NC}"
 
@@ -189,18 +189,18 @@ echo "4. Start port-forwarding for frontend (another terminal):"
 echo "   ${YELLOW}kubectl port-forward svc/frontend 8080:8080 -n default${NC}"
 echo ""
 echo "5. Run the optimization experiment:"
-echo "   ${YELLOW}python3 /home/EECS6446_project/files/optimizations/scripts/elascale_mape_k_experiment.py${NC}"
+echo "   ${YELLOW}python3 /home/common/EECS6446_project/files/optimizations/scripts/elascale_mape_k_experiment.py${NC}"
 echo ""
 echo "6. Alternatively, apply Elascale HPA directly:"
-echo "   ${YELLOW}kubectl apply -f /home/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml${NC}"
-echo "   ${YELLOW}kubectl apply -f /home/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml${NC}"
+echo "   ${YELLOW}kubectl apply -f /home/common/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml${NC}"
+echo "   ${YELLOW}kubectl apply -f /home/common/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml${NC}"
 
 echo -e "\n${YELLOW}Note: Ensure Prometheus and frontend are accessible before running experiments${NC}"
 
 # ============================================================
 # Create Quick Reference Guide
 # ============================================================
-cat > /home/EECS6446_project/files/optimizations/QUICK_REFERENCE.md <<'REFEOF'
+cat > /home/common/EECS6446_project/files/optimizations/QUICK_REFERENCE.md <<'REFEOF'
 # Elascale-Inspired Optimization - Quick Reference
 
 ## Key Commands
@@ -223,8 +223,8 @@ watch kubectl get hpa -n default
 ### Apply Configurations
 ```bash
 # Apply Elascale HPAs
-kubectl apply -f /home/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml
-kubectl apply -f /home/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml
+kubectl apply -f /home/common/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml
+kubectl apply -f /home/common/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml
 ```
 
 ### Troubleshooting
@@ -240,4 +240,4 @@ kubectl describe deployment frontend | grep -A 3 "Requests"
 ```
 REFEOF
 
-echo -e "\n${GREEN}âœ“ Quick reference guide created at: /home/EECS6446_project/files/optimizations/QUICK_REFERENCE.md${NC}"
+echo -e "\n${GREEN}âœ“ Quick reference guide created at: /home/common/EECS6446_project/files/optimizations/QUICK_REFERENCE.md${NC}"
