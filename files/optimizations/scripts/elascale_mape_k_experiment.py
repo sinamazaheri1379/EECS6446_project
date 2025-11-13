@@ -161,11 +161,11 @@ def execute_apply_hpa_config(config_type):
         print("Applying Elascale-optimized HPA (multi-factor)...")
         subprocess.run([
             "kubectl", "apply", "-f",
-            "/home/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml"
+            "/home/common/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml"
         ])
         subprocess.run([
             "kubectl", "apply", "-f",
-            "/home/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml"
+            "/home/common/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml"
         ])
     
     # Wait for HPA to be ready
@@ -178,7 +178,7 @@ def knowledge_store_results(experiment_name, data):
     """
     df = pd.DataFrame(data)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"/home/EECS6446_project/files/optimizations/results/{experiment_name}_{timestamp}.csv"
+    filename = f"/home/common/EECS6446_project/files/optimizations/results/{experiment_name}_{timestamp}.csv"
     df.to_csv(filename, index=False)
     print(f"Results saved to: {filename}")
     return filename
@@ -354,9 +354,9 @@ def main():
     print("="*60)
     print("\nNext steps:")
     print("1. Analyze results in Jupyter notebook:")
-    print("   jupyter notebook /home/EECS6446_project/files/optimizations/analysis/elascale_analysis.ipynb")
+    print("   jupyter notebook /home/common/EECS6446_project/files/optimizations/analysis/elascale_analysis.ipynb")
     print("\n2. Generate diagrams:")
-    print("   python3 /home/EECS6446_project/files/optimizations/scripts/generate_diagrams.py")
+    print("   python3 /home/common/EECS6446_project/files/optimizations/scripts/generate_diagrams.py")
 
 if __name__ == "__main__":
     main()
