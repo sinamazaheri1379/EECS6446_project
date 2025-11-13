@@ -18,7 +18,7 @@ import pandas as pd
 from pathlib import Path
 
 # Create output directory
-OUTPUT_DIR = Path("/home/EECS6446/files/optimizations/results/diagrams")
+OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results/diagrams")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Color scheme
@@ -460,7 +460,7 @@ def draw_performance_comparison():
     """
     Draw performance comparison charts if experimental data exists
     """
-    results_dir = Path("/home/EECS6446_project/files/optimizations/results")
+    results_dir = Path("/home/common/EECS6446_project/files/optimizations/results")
     
     # Check if any result files exist
     csv_files = list(results_dir.glob("*.csv"))
