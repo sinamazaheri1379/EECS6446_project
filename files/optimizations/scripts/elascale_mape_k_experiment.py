@@ -21,7 +21,7 @@ import json
 PROMETHEUS_URL = "http://localhost:9090"
 LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
-OPT_BASE = "/home/common/EECS6446_project/optimizations"
+OPT_BASE = "/home/common/EECS6446_project/files/optimizations"
 # Load test scenarios (users, duration in seconds)
 LOAD_SCENARIOS = [
     {"users": 50, "duration": 300, "spawn_rate": 10},
