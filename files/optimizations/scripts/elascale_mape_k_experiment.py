@@ -149,7 +149,7 @@ def execute_apply_hpa_config(config_type):
     config_type: 'baseline' or 'elascale'
     """
     if config_type == 'baseline':
-        print("Applying baseline HPA from hpa-baseline.yaml...")
+        print("Applying baseline HPA from hpa_backup.yaml...")
         
         # Remove existing HPAs to start clean
         print("  Removing existing HPAs...")
@@ -161,7 +161,7 @@ def execute_apply_hpa_config(config_type):
         
         # Apply baseline configuration
         print("  Applying baseline HPA...")
-        baseline_path = f"{OPT_BASE}/scaling/hpa-backup.yaml"
+        baseline_path = f"{OPT_BASE}/scaling/hpa_backup.yaml"
         result = subprocess.run([
             "kubectl", "apply", "-f", baseline_path
         ], capture_output=True, text=True)
