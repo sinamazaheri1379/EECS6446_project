@@ -14,7 +14,8 @@ import subprocess
 import pandas as pd
 from datetime import datetime
 import json
-
+import sys
+from pathlib import Path 
 # ============================================================
 # Configuration
 # ============================================================
@@ -22,6 +23,8 @@ PROMETHEUS_URL = "http://localhost:9090"
 LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
 OPT_BASE = "/home/common/EECS6446_project/files/optimizations"
+OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Load test scenarios (users, duration in seconds)
 LOAD_SCENARIOS = [
     {"users": 50, "duration": 300, "spawn_rate": 10},
