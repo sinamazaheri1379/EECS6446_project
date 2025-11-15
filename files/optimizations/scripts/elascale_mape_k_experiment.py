@@ -149,27 +149,71 @@ def execute_apply_hpa_config(config_type):
     config_type: 'baseline' or 'elascale'
     """
     if config_type == 'baseline':
-        print("Applying baseline HPA (CPU-only, 70% threshold)...")
-        for service in SERVICES:
-            subprocess.run([
-                "kubectl", "autoscale", "deployment", service,
-                "--cpu-percent=70", "--min=1", "--max=10",
-                "-n", NAMESPACE
-            ])
+        print("Applying baseline HPA from hpa-baseline.yaml...")
+        
+        # Remove existing HPAs to start clean
+        print("  Removing existing HPAs...")
+        subprocess.run([
+            "kubectl", "delete", "hpa", "--all", "-n", NAMESPACE
+        ], capture_output=True, stderr=subprocess.DEVNULL)
+        
+        time.sleep(5)
+        
+        # Apply baseline configuration
+        print("  Applying baseline HPA...")
+        baseline_path = f"{OPT_BASE}/scaling/hpa-baseline.yaml"
+        result = subprocess.run([
+            "kubectl", "apply", "-f", baseline_path
+        ], capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"❌ Error applying baseline: {result.stderr}")
+            return False
+        
+        print("✓ Baseline HPA applied successfully")
     
     elif config_type == 'elascale':
         print("Applying Elascale-optimized HPA (multi-factor)...")
+        
+        # Remove existing HPAs
+        print("  Removing existing HPAs...")
         subprocess.run([
+            "kubectl", "delete", "hpa", "--all", "-n", NAMESPACE
+        ], capture_output=True, stderr=subprocess.DEVNULL)
+        
+        time.sleep(5)
+        
+        # Apply Elascale configurations
+        print("  Applying Elascale Cart Service HPA...")
+        result1 = subprocess.run([
             "kubectl", "apply", "-f",
-            "/home/common/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml"
-        ])
-        subprocess.run([
+            f"{OPT_BASE}/scaling/cartservice-elascale-hpa.yaml"
+        ], capture_output=True, text=True)
+        
+        print("  Applying Elascale Services HPA...")
+        result2 = subprocess.run([
             "kubectl", "apply", "-f",
-            "/home/common/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml"
-        ])
+            f"{OPT_BASE}/scaling/services-elascale-hpa.yaml"
+        ], capture_output=True, text=True)
+        
+        if result1.returncode != 0 or result2.returncode != 0:
+            print("❌ Error applying Elascale HPA")
+            if result1.returncode != 0:
+                print(f"Cart service error: {result1.stderr}")
+            if result2.returncode != 0:
+                print(f"Services error: {result2.stderr}")
+            return False
+        
+        print("✓ Elascale HPA applied successfully")
     
-    # Wait for HPA to be ready
+    # Show current HPA status
+    print("\nCurrent HPA Status:")
+    subprocess.run(["kubectl", "get", "hpa", "-n", NAMESPACE])
+    
+    # Wait for HPA to stabilize and start collecting metrics
+    print("\nWaiting 30s for HPA to stabilize...")
     time.sleep(30)
+    return True
 
 # -------------------- KNOWLEDGE --------------------
 def knowledge_store_results(experiment_name, data):
