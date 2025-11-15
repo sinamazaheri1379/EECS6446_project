@@ -4,71 +4,66 @@ metadata:
   name: cartservice-elascale
   namespace: default
   labels:
-    optimization: elascale
+    optimization: elascale-fixed
     service: cartservice
   annotations:
-    description: "Elascale-optimized HPA for cartservice with multi-factor formula"
-    formula: "f = 0.3Â·CPU + 0.4Â·MEM + 0.1Â·NET + 0.2Â·REP"
-    replication-factor: "3:1 ratio with redis-cart (1 Redis per 3 cart instances)"
+    description: "Fixed Elascale HPA for cartservice - Redis bottleneck aware"
+    formula: "f = 0.3·CPU + 0.4·MEM + 0.3·REP (Redis-aware)"
+    strategy: "Aggressive scale-up to combat contribution time, Redis 3:1 ratio"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: cartservice
   
-  # Higher minimum for availability (Elascale principle)
-  minReplicas: 2
+  # CRITICAL FIX: Higher minimum for Redis load distribution
+  minReplicas: 3  # Start with 3 (not 2) for Redis 3:1 ratio
   maxReplicas: 15
   
   metrics:
-  # CPU Utilization (Î± = 0.3)
-  # Cartservice is moderately CPU intensive due to Redis interactions
+  # CPU Utilization - α = 0.3
+  # FIX: Increased threshold from 60% to 65% (closer to baseline 70%)
   - type: Resource
     resource:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 60  # Scale up when CPU > 60%
+        averageUtilization: 65  # Was 60%, now 65%
   
-  # Memory Utilization (Î² = 0.4 - HIGHEST WEIGHT)
-  # Higher weight due to cart data caching requirements
+  # Memory Utilization - β = 0.4 (highest weight)
+  # FIX: Lowered from 65% to 60% (memory more critical for cart data)
   - type: Resource
     resource:
       name: memory
       target:
         type: Utilization
-        averageUtilization: 65  # Scale up when Memory > 65%
-  
-  # Network utilization would be Î³ = 0.1 (lightweight protocol)
-  # Note: Requires custom metrics adapter for network metrics
-  # This is commented out but represents the concept from Elascale paper
-  
-  # Replication factor Î» = 0.2 is implicit in the behavior policies below
-  # Maintains 3:1 ratio with Redis instances
+        averageUtilization: 60  # Was 65%, now 60%
   
   behavior:
     scaleUp:
-      # Fast scale-up to combat contribution time (Elascale Section 4.2)
-      stabilizationWindowSeconds: 30  # React quickly (vs 60s default)
+      # AGGRESSIVE scale-up for contribution time problem
+      # FIX: Reduced stabilization from 30s to 0s for immediate response
+      stabilizationWindowSeconds: 0  # Was 30s, now INSTANT
       policies:
-      # Aggressive scale-up to handle contribution time
-      # Based on Elascale finding: contribution time >> provisioning time
+      # FIX: Reduced from +3 pods to +2 pods (less aggressive)
       - type: Pods
-        value: 3  # Add 3 pods at once (not 1!)
-        periodSeconds: 30
+        value: 2  # Was 3, now 2
+        periodSeconds: 15  # Was 30s, now 15s (faster checks)
       - type: Percent
-        value: 50  # Or 50% of current pods
-        periodSeconds: 30
-      selectPolicy: Max  # Choose most aggressive policy
+        value: 100  # Double capacity
+        periodSeconds: 15
+      selectPolicy: Max  # Most aggressive policy wins
     
     scaleDown:
-      # Conservative scale-down to maintain service dependencies
-      stabilizationWindowSeconds: 300  # 5 min stabilization (prevent flapping)
+      # CONSERVATIVE scale-down to maintain Redis ratio
+      # FIX: Increased stabilization from 300s to 420s (7 minutes)
+      stabilizationWindowSeconds: 420  # Was 300s, now 420s
       policies:
+      # Very conservative: only -1 pod at a time
       - type: Pods
-        value: 1  # Remove only 1 pod at a time
-        periodSeconds: 120
+        value: 1
+        periodSeconds: 180  # Was 120s, now 180s
       - type: Percent
-        value: 10  # Maximum 10% reduction at a time
-        periodSeconds: 120
-      selectPolicy: Min  # Choose most conservative policy
+        value: 5  # Maximum 5% reduction (was 10%)
+        periodSeconds: 180
+      selectPolicy: Min  # Most conservative policy wins
