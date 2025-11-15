@@ -31,7 +31,9 @@ LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
 OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
+# Locust automation settings
+LOCUST_AUTOMATED = True  # Set to False for manual control
+LOCUST_HOST = "http://localhost:8080"  # Frontend service URL
 # CRITICAL: Use exact same load pattern as baseline report
 LOAD_SCENARIOS = [
     {"name": "baseline_50", "users": 50, "duration": 60, "spawn_rate": 10},
@@ -61,6 +63,101 @@ SERVICE_WEIGHTS = {
     "recommendationservice": {"alpha": 0.6, "beta": 0.4, "gamma": 0.0, "lambda": 0.0},
     "productcatalogservice": {"alpha": 0.3, "beta": 0.5, "gamma": 0.0, "lambda": 0.2},
 }
+# ============================================================
+# Locust Automation Functions
+# ============================================================
+
+def start_locust_load(users, spawn_rate):
+    """
+    Start or update Locust load test via API
+    
+    Args:
+        users: Number of users to simulate
+        spawn_rate: Users spawned per second
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        response = requests.post(
+            f"{LOCUST_URL}/swarm",
+            data={
+                "user_count": users,
+                "spawn_rate": spawn_rate,
+                "host": LOCUST_HOST
+            },
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            print(f"  ✓ Locust started: {users} users @ {spawn_rate} users/sec spawn rate")
+            return True
+        else:
+            print(f"  ❌ Locust API error: {response.status_code}")
+            print(f"     Response: {response.text}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ❌ Cannot connect to Locust API: {e}")
+        print(f"     Make sure Locust is running at {LOCUST_URL}")
+        return False
+def stop_locust_load():
+    """
+    Stop Locust load test via API
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        response = requests.get(
+            f"{LOCUST_URL}/stop",
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            print("  ✓ Locust stopped")
+            return True
+        else:
+            print(f"  ⚠️  Locust stop returned: {response.status_code}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ⚠️  Cannot stop Locust: {e}")
+        return False
+
+def get_locust_stats():
+    """
+    Get current Locust statistics via API
+    
+    Returns:
+        dict: Locust stats or None if failed
+    """
+    try:
+        response = requests.get(
+            f"{LOCUST_URL}/stats/requests",
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+            
+    except requests.exceptions.RequestException:
+        return None
+
+def check_locust_ready():
+    """
+    Check if Locust is accessible and ready
+    
+    Returns:
+        bool: True if Locust is ready, False otherwise
+    """
+    try:
+        response = requests.get(LOCUST_URL, timeout=5)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
 
 # ============================================================
 # Prometheus Query Functions
@@ -252,12 +349,32 @@ def run_experiment(config_name, load_pattern):
         print(f"Scenario: {scenario['name']} - {scenario['users']} users for {scenario['duration']}s")
         print(f"{'-'*60}")
         
-        print(f"\n⚠️  MANUAL STEP: Set Locust to {scenario['users']} users")
-        print(f"   1. Open Locust: http://localhost:8089")
-        print(f"   2. Set users: {scenario['users']}")
-        print(f"   3. Set spawn rate: {scenario['spawn_rate']}")
-        print(f"   4. Press Enter when load is applied...")
-        input()
+        # Start load - automated or manual
+        if LOCUST_AUTOMATED:
+            print(f"\n🤖 Automatically starting Locust load...")
+            if not start_locust_load(scenario['users'], scenario['spawn_rate']):
+                print("\n⚠️  Automated Locust control failed!")
+                print("Falling back to manual control...")
+                print(f"\n⚠️  MANUAL STEP: Set Locust to {scenario['users']} users")
+                print(f"   1. Open Locust: {LOCUST_URL}")
+                print(f"   2. Set users: {scenario['users']}")
+                print(f"   3. Set spawn rate: {scenario['spawn_rate']}")
+                print(f"   4. Press Enter when load is applied...")
+                input()
+        else:
+            # Manual control
+            print(f"\n⚠️  MANUAL STEP: Set Locust to {scenario['users']} users")
+            print(f"   1. Open Locust: {LOCUST_URL}")
+            print(f"   2. Set users: {scenario['users']}")
+            print(f"   3. Set spawn rate: {scenario['spawn_rate']}")
+            print(f"   4. Press Enter when load is applied...")
+            input()
+        
+        # Wait a bit for load to ramp up
+        if LOCUST_AUTOMATED:
+            ramp_time = min(10, scenario['users'] / scenario['spawn_rate'])
+            print(f"  Waiting {int(ramp_time)}s for load to ramp up...")
+            time.sleep(ramp_time)
         
         # Collect metrics during scenario
         scenario_start = time.time()
@@ -278,8 +395,15 @@ def run_experiment(config_name, load_pattern):
             cart = snapshot['services']['cartservice']
             req = snapshot['requests']
             
+            # Get Locust stats if available
+            locust_info = ""
+            if LOCUST_AUTOMATED:
+                locust_stats = get_locust_stats()
+                if locust_stats and 'user_count' in locust_stats:
+                    locust_info = f"Locust:{locust_stats['user_count']:4d} | "
+            
             print(f"  [{int(time.time() - scenario_start):3d}s] "
-                  f"Users:{scenario['users']:4d} | "
+                  f"{locust_info}"
                   f"Frontend:{frontend['replicas_ordered']:2d}({frontend['replicas_ready']:2d}) | "
                   f"Cart:{cart['replicas_ordered']:2d}({cart['replicas_ready']:2d}) | "
                   f"RPS:{req['throughput_rps']:6.1f} | "
@@ -289,6 +413,11 @@ def run_experiment(config_name, load_pattern):
             time.sleep(interval)
         
         elapsed_minutes += scenario['duration'] / 60
+    
+    # Stop load at end of experiment
+    if LOCUST_AUTOMATED:
+        print(f"\n🛑 Stopping Locust load...")
+        stop_locust_load()
     
     print(f"\n✓ Experiment complete: {config_name}")
     return all_metrics
@@ -357,7 +486,6 @@ def apply_hpa_config(config_type):
     
     print("  Waiting 30s for HPA to initialize...")
     time.sleep(30)
-
 # ============================================================
 # Results Processing
 # ============================================================
@@ -414,11 +542,6 @@ def flatten_and_save_results(metrics_list, config_name):
     
     print(f"\n✓ Results saved: {filename}")
     return df, filename
-
-# ============================================================
-# System Checks
-# ============================================================
-
 def check_prerequisites():
     """Check all prerequisites before running experiment"""
     print(f"\n{'='*60}")
@@ -465,13 +588,25 @@ def check_prerequisites():
     
     # Check Locust
     print("\n3. Checking Locust availability...")
-    try:
-        response = requests.get(LOCUST_URL, timeout=5)
-        print("   ✓ Locust accessible")
-    except:
-        print("   ⚠️  Locust not accessible")
-        print("   Make sure Locust is running: http://localhost:8089")
-        print("   You'll need to manually control load during experiment")
+    if LOCUST_AUTOMATED:
+        if check_locust_ready():
+            print(f"   ✓ Locust accessible at {LOCUST_URL}")
+            print("   ✓ Automated load control enabled")
+        else:
+            print(f"   ❌ Locust not accessible at {LOCUST_URL}")
+            print("   To use automated control, start Locust with:")
+            print(f"     locust -f /path/to/locustfile.py --host={LOCUST_HOST} --web-port=8089")
+            print("   OR set LOCUST_AUTOMATED=False in the script for manual control")
+            checks_passed = False
+    else:
+        try:
+            response = requests.get(LOCUST_URL, timeout=5)
+            print(f"   ⚠️  Locust accessible (manual control mode)")
+            print("   You will need to manually adjust load during experiment")
+        except:
+            print(f"   ⚠️  Locust not accessible")
+            print("   Make sure to start Locust before running experiment")
+            print(f"     locust -f /path/to/locustfile.py --host={LOCUST_HOST} --web-port=8089")
     
     # Check services
     print("\n4. Checking services deployment...")
@@ -503,7 +638,6 @@ def check_prerequisites():
         sys.exit(1)
     
     return True
-
 # ============================================================
 # Main Execution
 # ============================================================
@@ -582,7 +716,7 @@ def main():
     print("NEXT STEPS")
     print("="*70)
     print("\n1. Generate comparison visualizations:")
-    print(f"   python3 /home/common/EECS6446_project/files/optimizations/scripts/generate_unified_comparison.py")
+    print(f"   python3 /home/claude/generate_unified_comparison.py")
     print("\n2. Analyze results in detail:")
     print("   - Check CSV files for raw data")
     print("   - Compare metrics against baseline report")
