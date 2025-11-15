@@ -21,7 +21,7 @@ import json
 PROMETHEUS_URL = "http://localhost:9090"
 LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
-
+OPT_BASE = "/home/common/EECS6446_project/optimizations"
 # Load test scenarios (users, duration in seconds)
 LOAD_SCENARIOS = [
     {"users": 50, "duration": 300, "spawn_rate": 10},
@@ -161,7 +161,7 @@ def execute_apply_hpa_config(config_type):
         
         # Apply baseline configuration
         print("  Applying baseline HPA...")
-        baseline_path = f"{OPT_BASE}/scaling/hpa-baseline.yaml"
+        baseline_path = f"{OPT_BASE}/scaling/hpa-backup.yaml"
         result = subprocess.run([
             "kubectl", "apply", "-f", baseline_path
         ], capture_output=True, text=True)
