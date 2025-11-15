@@ -29,7 +29,7 @@ import numpy as np
 PROMETHEUS_URL = "http://localhost:9090"
 LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
-OUTPUT_DIR = Path("/home/claude/unified_results")
+OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # CRITICAL: Use exact same load pattern as baseline report
@@ -582,7 +582,7 @@ def main():
     print("NEXT STEPS")
     print("="*70)
     print("\n1. Generate comparison visualizations:")
-    print(f"   python3 /home/claude/generate_unified_comparison.py")
+    print(f"   python3 /home/common/EECS6446_project/files/optimizations/scripts/generate_unified_comparison.py")
     print("\n2. Analyze results in detail:")
     print("   - Check CSV files for raw data")
     print("   - Compare metrics against baseline report")
