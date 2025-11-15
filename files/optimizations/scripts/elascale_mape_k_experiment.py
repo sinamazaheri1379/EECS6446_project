@@ -155,7 +155,7 @@ def execute_apply_hpa_config(config_type):
         print("  Removing existing HPAs...")
         subprocess.run([
             "kubectl", "delete", "hpa", "--all", "-n", NAMESPACE
-        ], capture_output=True, stderr=subprocess.DEVNULL)
+        ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         
         time.sleep(5)
         
