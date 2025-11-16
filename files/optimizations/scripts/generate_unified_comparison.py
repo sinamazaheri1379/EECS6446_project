@@ -14,8 +14,8 @@ import numpy as np
 from datetime import datetime
 
 # Configuration
-RESULTS_DIR = Path("/home/common/EECS6446_project/optimizations/files/results")
-OUTPUT_DIR = Path("/home/common/EECS6446_project/optimizations/files/results/diagrams")
+RESULTS_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
+OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results/diagrams")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Set plotting style to match baseline report
