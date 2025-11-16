@@ -28,12 +28,11 @@ import numpy as np
 # ============================================================
 PROMETHEUS_URL = "http://localhost:9090"
 LOCUST_URL = "http://localhost:8089"
+LOCUST_HOST = "http://localhost:8080"
 NAMESPACE = "default"
 OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-# Locust automation settings
-LOCUST_AUTOMATED = True  # Set to False for manual control
-LOCUST_HOST = "http://localhost:8080"  # Frontend service URL
+
 # CRITICAL: Use exact same load pattern as baseline report
 LOAD_SCENARIOS = [
     {"name": "baseline_50", "users": 50, "duration": 60, "spawn_rate": 10},
@@ -63,101 +62,62 @@ SERVICE_WEIGHTS = {
     "recommendationservice": {"alpha": 0.6, "beta": 0.4, "gamma": 0.0, "lambda": 0.0},
     "productcatalogservice": {"alpha": 0.3, "beta": 0.5, "gamma": 0.0, "lambda": 0.2},
 }
+
 # ============================================================
 # Locust Automation Functions
 # ============================================================
 
-def start_locust_load(users, spawn_rate):
-    """
-    Start or update Locust load test via API
-    
-    Args:
-        users: Number of users to simulate
-        spawn_rate: Users spawned per second
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
+def start_load_test(users, spawn_rate):
+    """Programmatically start Locust load test"""
     try:
         response = requests.post(
             f"{LOCUST_URL}/swarm",
-            data={
-                "user_count": users,
-                "spawn_rate": spawn_rate,
-                "host": LOCUST_HOST
-            },
-            timeout=10
+            data={"user_count": users, "spawn_rate": spawn_rate}
         )
-        
         if response.status_code == 200:
-            print(f"  ✓ Locust started: {users} users @ {spawn_rate} users/sec spawn rate")
+            print(f"   ✓ Locust started: {users} users @ {spawn_rate}/s spawn rate")
             return True
         else:
-            print(f"  ❌ Locust API error: {response.status_code}")
-            print(f"     Response: {response.text}")
+            print(f"   ❌ Locust start failed: {response.status_code}")
             return False
-            
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ Cannot connect to Locust API: {e}")
-        print(f"     Make sure Locust is running at {LOCUST_URL}")
+    except Exception as e:
+        print(f"   ❌ Cannot start Locust: {e}")
         return False
-def stop_locust_load():
-    """
-    Stop Locust load test via API
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
+
+def stop_load_test():
+    """Stop Locust load test"""
     try:
-        response = requests.get(
-            f"{LOCUST_URL}/stop",
-            timeout=10
-        )
-        
+        response = requests.get(f"{LOCUST_URL}/stop")
         if response.status_code == 200:
-            print("  ✓ Locust stopped")
+            print("   ✓ Locust stopped")
             return True
         else:
-            print(f"  ⚠️  Locust stop returned: {response.status_code}")
+            print(f"   ⚠️  Locust stop returned: {response.status_code}")
             return False
-            
-    except requests.exceptions.RequestException as e:
-        print(f"  ⚠️  Cannot stop Locust: {e}")
+    except Exception as e:
+        print(f"   ⚠️  Cannot stop Locust: {e}")
         return False
 
 def get_locust_stats():
-    """
-    Get current Locust statistics via API
-    
-    Returns:
-        dict: Locust stats or None if failed
-    """
+    """Get current Locust statistics"""
     try:
-        response = requests.get(
-            f"{LOCUST_URL}/stats/requests",
-            timeout=5
-        )
-        
+        response = requests.get(f"{LOCUST_URL}/stats/requests")
         if response.status_code == 200:
             return response.json()
-        else:
-            return None
-            
-    except requests.exceptions.RequestException:
-        return None
+    except:
+        pass
+    return None
 
-def check_locust_ready():
-    """
-    Check if Locust is accessible and ready
-    
-    Returns:
-        bool: True if Locust is ready, False otherwise
-    """
+def reset_locust_stats():
+    """Reset Locust statistics"""
     try:
-        response = requests.get(LOCUST_URL, timeout=5)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
-        return False
+        response = requests.get(f"{LOCUST_URL}/stats/reset")
+        if response.status_code == 200:
+            print("   ✓ Locust stats reset")
+            return True
+    except:
+        print("   ⚠️  Cannot reset Locust stats")
+    return False
 
 # ============================================================
 # Prometheus Query Functions
@@ -172,109 +132,76 @@ def query_prometheus(query, timeout=10):
             timeout=timeout
         )
         if response.status_code == 200:
-            result = response.json()["data"]["result"]
-            return result
-        return []
+            result = response.json()
+            if result.get("status") == "success":
+                return result.get("data", {}).get("result", [])
     except Exception as e:
-        print(f"⚠️  Prometheus query failed: {e}")
-        return []
+        print(f"Prometheus query error: {e}")
+    return []
 
-def query_prometheus_range(query, start, end, step="15s"):
-    """Query Prometheus range and return results"""
-    try:
-        response = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query_range",
-            params={
-                "query": query,
-                "start": start,
-                "end": end,
-                "step": step
-            },
-            timeout=10
-        )
-        if response.status_code == 200:
-            result = response.json()["data"]["result"]
-            return result
-        return []
-    except Exception as e:
-        print(f"⚠️  Prometheus range query failed: {e}")
-        return []
-
-# ============================================================
-# Metric Collection (All Baseline Metrics)
-# ============================================================
-
-def collect_service_metrics(service):
-    """
-    Collect comprehensive metrics for a service
-    Matches ALL metrics from baseline report
-    """
+def collect_service_metrics(service_name):
+    """Collect all metrics for a specific service"""
     metrics = {
-        "service": service,
-        "timestamp": datetime.now().isoformat(),
+        "cpu_millicores": 0,
+        "cpu_util_percent": 0,
+        "memory_bytes": 0,
+        "memory_util_percent": 0,
+        "network_rx_bytes_per_sec": 0,
+        "network_tx_bytes_per_sec": 0,
+        "replicas_ordered": 0,
+        "replicas_ready": 0,
     }
     
-    # CPU utilization (millicores)
-    query = f'sum(rate(container_cpu_usage_seconds_total{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}[1m])) * 1000'
+    # CPU usage (millicores)
+    query = f'sum(rate(container_cpu_usage_seconds_total{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}}[1m])) * 1000'
     result = query_prometheus(query)
     metrics["cpu_millicores"] = float(result[0]["value"][1]) if result else 0
     
     # CPU utilization percentage
-    query = f'sum(rate(container_cpu_usage_seconds_total{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}[1m])) * 100 / sum(kube_pod_container_resource_limits{{pod=~"{service}-.*",namespace="{NAMESPACE}",resource="cpu"}})'
+    query = f'sum(rate(container_cpu_usage_seconds_total{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}}[1m])) / sum(kube_pod_container_resource_requests{{namespace="{NAMESPACE}",pod=~"{service_name}-.*",resource="cpu"}}) * 100'
     result = query_prometheus(query)
     metrics["cpu_util_percent"] = float(result[0]["value"][1]) if result else 0
     
-    # Memory utilization (bytes)
-    query = f'sum(container_memory_usage_bytes{{pod=~"{service}-.*",namespace="{NAMESPACE}"}})'
+    # Memory usage (bytes)
+    query = f'sum(container_memory_usage_bytes{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}})'
     result = query_prometheus(query)
     metrics["memory_bytes"] = float(result[0]["value"][1]) if result else 0
     
     # Memory utilization percentage
-    query = f'sum(container_memory_usage_bytes{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}) * 100 / sum(kube_pod_container_resource_limits{{pod=~"{service}-.*",namespace="{NAMESPACE}",resource="memory"}})'
+    query = f'sum(container_memory_usage_bytes{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}}) / sum(kube_pod_container_resource_requests{{namespace="{NAMESPACE}",pod=~"{service_name}-.*",resource="memory"}}) * 100'
     result = query_prometheus(query)
     metrics["memory_util_percent"] = float(result[0]["value"][1]) if result else 0
     
-    # Network bytes received
-    query = f'sum(rate(container_network_receive_bytes_total{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}[1m]))'
+    # Network RX (bytes/sec)
+    query = f'sum(rate(container_network_receive_bytes_total{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}}[1m]))'
     result = query_prometheus(query)
     metrics["network_rx_bytes_per_sec"] = float(result[0]["value"][1]) if result else 0
     
-    # Network bytes transmitted
-    query = f'sum(rate(container_network_transmit_bytes_total{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}[1m]))'
+    # Network TX (bytes/sec)
+    query = f'sum(rate(container_network_transmit_bytes_total{{namespace="{NAMESPACE}",pod=~"{service_name}-.*"}}[1m]))'
     result = query_prometheus(query)
     metrics["network_tx_bytes_per_sec"] = float(result[0]["value"][1]) if result else 0
     
-    # Replica count (ordered - what HPA wants)
-    try:
-        result = subprocess.run(
-            ["kubectl", "get", "deployment", service, "-n", NAMESPACE, 
-             "-o", "jsonpath={.status.replicas}"],
-            capture_output=True, text=True, timeout=5, check=False
-        )
-        metrics["replicas_ordered"] = int(result.stdout) if result.stdout else 0
-    except:
-        metrics["replicas_ordered"] = 0
+    # Replicas (desired/ordered)
+    query = f'kube_deployment_spec_replicas{{namespace="{NAMESPACE}",deployment="{service_name}"}}'
+    result = query_prometheus(query)
+    metrics["replicas_ordered"] = int(float(result[0]["value"][1])) if result else 0
     
-    # Ready replicas (what's actually ready)
-    try:
-        result = subprocess.run(
-            ["kubectl", "get", "deployment", service, "-n", NAMESPACE,
-             "-o", "jsonpath={.status.readyReplicas}"],
-            capture_output=True, text=True, timeout=5, check=False
-        )
-        metrics["replicas_ready"] = int(result.stdout) if result.stdout else 0
-    except:
-        metrics["replicas_ready"] = 0
+    # Replicas (ready)
+    query = f'kube_deployment_status_replicas_ready{{namespace="{NAMESPACE}",deployment="{service_name}"}}'
+    result = query_prometheus(query)
+    metrics["replicas_ready"] = int(float(result[0]["value"][1])) if result else 0
     
     return metrics
 
 def collect_request_metrics():
-    """
-    Collect request-level metrics from frontend
-    Matches baseline report: throughput, response time, fault rate
-    """
+    """Collect application-level request metrics"""
     metrics = {
-        "timestamp": datetime.now().isoformat(),
+        "throughput_rps": 0,
+        "avg_response_time_ms": 0,
+        "p95_response_time_ms": 0,
+        "fault_rate_percent": 0,
+        "total_requests": 0
     }
     
     # Throughput (requests per second)
@@ -295,7 +222,10 @@ def collect_request_metrics():
     # Fault rate (percentage)
     query = 'sum(rate(http_requests_total{job="frontend",status=~"5.."}[1m])) / sum(rate(http_requests_total{job="frontend"}[1m])) * 100'
     result = query_prometheus(query)
-    metrics["fault_rate_percent"] = float(result[0]["value"][1]) if result and result[0]["value"][1] != "NaN" else 0
+    if result and result[0]["value"][1] != "NaN":
+        metrics["fault_rate_percent"] = float(result[0]["value"][1])
+    else:
+        metrics["fault_rate_percent"] = 0
     
     # Total request count
     query = 'sum(http_requests_total{job="frontend"})'
@@ -318,234 +248,316 @@ def collect_complete_snapshot():
     return snapshot
 
 # ============================================================
+# HPA Configuration Management
+# ============================================================
+
+def apply_hpa_config(config_type):
+    """
+    Apply HPA configuration (baseline or elascale)
+    
+    Args:
+        config_type: "baseline" or "elascale"
+    """
+    print(f"\n{'='*60}")
+    print(f"Applying HPA Configuration: {config_type.upper()}")
+    print(f"{'='*60}\n")
+    
+    config_dir = Path("/home/common/EECS6446_project/files/optimizations/hpa_configs")
+    
+    if config_type == "baseline":
+        # Apply baseline CPU-only HPA (50% threshold)
+        for service in SERVICES:
+            hpa_file = config_dir / "baseline" / f"{service}-hpa.yaml"
+            if hpa_file.exists():
+                try:
+                    result = subprocess.run(
+                        ["kubectl", "apply", "-f", str(hpa_file)],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    if result.returncode == 0:
+                        print(f"   ✓ Applied baseline HPA for {service}")
+                    else:
+                        print(f"   ❌ Failed to apply {service}: {result.stderr}")
+                except Exception as e:
+                    print(f"   ❌ Error applying {service}: {e}")
+            else:
+                print(f"   ⚠️  HPA file not found: {hpa_file}")
+    
+    elif config_type == "elascale":
+        # Apply Elascale multi-factor HPA
+        for service in SERVICES:
+            hpa_file = config_dir / "elascale" / f"{service}-hpa.yaml"
+            if hpa_file.exists():
+                try:
+                    result = subprocess.run(
+                        ["kubectl", "apply", "-f", str(hpa_file)],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    if result.returncode == 0:
+                        print(f"   ✓ Applied elascale HPA for {service}")
+                    else:
+                        print(f"   ❌ Failed to apply {service}: {result.stderr}")
+                except Exception as e:
+                    print(f"   ❌ Error applying {service}: {e}")
+            else:
+                print(f"   ⚠️  HPA file not found: {hpa_file}")
+    
+    print(f"\n{'='*60}\n")
+
+# ============================================================
 # Experiment Execution
 # ============================================================
 
-def run_experiment(config_name, load_pattern):
+def run_single_experiment(config_name, load_scenarios):
     """
     Run complete experiment with specified HPA configuration
     
     Args:
         config_name: "baseline" or "elascale"
-        load_pattern: List of load scenarios
+        load_scenarios: List of load scenarios
+        
+    Returns:
+        List of metric snapshots
     """
-    print(f"\n{'='*60}")
-    print(f"Running Experiment: {config_name.upper()}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*70}")
+    print(f"RUNNING EXPERIMENT: {config_name.upper()}")
+    print(f"{'='*70}\n")
     
     # Apply HPA configuration
     apply_hpa_config(config_name)
     
-    print("Waiting 30s for HPA to stabilize...")
-    time.sleep(30)
+    # CRITICAL: Wait for HPA to stabilize
+    print("Waiting 60s for HPA controllers to stabilize...")
+    time.sleep(60)
+    
+    # Reset Locust stats before starting
+    reset_locust_stats()
     
     # Collect all metrics
     all_metrics = []
     experiment_start = time.time()
-    elapsed_minutes = 0
+    scenario_number = 0
     
-    for scenario in load_pattern:
-        print(f"\n{'-'*60}")
-        print(f"Scenario: {scenario['name']} - {scenario['users']} users for {scenario['duration']}s")
-        print(f"{'-'*60}")
+    for scenario in load_scenarios:
+        scenario_number += 1
+        print(f"\n{'-'*70}")
+        print(f"SCENARIO {scenario_number}/{len(load_scenarios)}: {scenario['name']}")
+        print(f"Users: {scenario['users']} | Duration: {scenario['duration']}s | Spawn Rate: {scenario['spawn_rate']}/s")
+        print(f"{'-'*70}\n")
         
-        # Start load - automated or manual
-        if LOCUST_AUTOMATED:
-            print(f"\n🤖 Automatically starting Locust load...")
-            if not start_locust_load(scenario['users'], scenario['spawn_rate']):
-                print("\n⚠️  Automated Locust control failed!")
-                print("Falling back to manual control...")
-                print(f"\n⚠️  MANUAL STEP: Set Locust to {scenario['users']} users")
-                print(f"   1. Open Locust: {LOCUST_URL}")
-                print(f"   2. Set users: {scenario['users']}")
-                print(f"   3. Set spawn rate: {scenario['spawn_rate']}")
-                print(f"   4. Press Enter when load is applied...")
-                input()
-        else:
-            # Manual control
-            print(f"\n⚠️  MANUAL STEP: Set Locust to {scenario['users']} users")
-            print(f"   1. Open Locust: {LOCUST_URL}")
-            print(f"   2. Set users: {scenario['users']}")
-            print(f"   3. Set spawn rate: {scenario['spawn_rate']}")
-            print(f"   4. Press Enter when load is applied...")
-            input()
+        # Start load test automatically
+        if not start_load_test(scenario['users'], scenario['spawn_rate']):
+            print(f"❌ Failed to start load test for scenario {scenario['name']}")
+            continue
         
-        # Wait a bit for load to ramp up
-        if LOCUST_AUTOMATED:
-            ramp_time = min(10, scenario['users'] / scenario['spawn_rate'])
-            print(f"  Waiting {int(ramp_time)}s for load to ramp up...")
-            time.sleep(ramp_time)
+        # Wait for spawn to complete
+        spawn_time = scenario['users'] / scenario['spawn_rate']
+        print(f"Waiting {spawn_time:.1f}s for users to spawn...")
+        time.sleep(spawn_time + 5)  # Extra 5s buffer
         
         # Collect metrics during scenario
         scenario_start = time.time()
-        interval = 10  # Collect every 10 seconds
+        collection_interval = 10  # Collect every 10 seconds
+        next_collection = scenario_start + collection_interval
         
-        while time.time() - scenario_start < scenario['duration']:
-            snapshot = collect_complete_snapshot()
-            snapshot['config'] = config_name
-            snapshot['scenario'] = scenario['name']
-            snapshot['scenario_users'] = scenario['users']
-            snapshot['elapsed_total_seconds'] = time.time() - experiment_start
-            snapshot['elapsed_minutes'] = elapsed_minutes + (time.time() - scenario_start) / 60
+        while time.time() < scenario_start + scenario['duration']:
+            current_time = time.time()
             
-            all_metrics.append(snapshot)
+            # Time to collect metrics?
+            if current_time >= next_collection:
+                snapshot = collect_complete_snapshot()
+                snapshot['config'] = config_name
+                snapshot['scenario'] = scenario['name']
+                snapshot['scenario_users'] = scenario['users']
+                snapshot['scenario_number'] = scenario_number
+                snapshot['elapsed_total_seconds'] = current_time - experiment_start
+                snapshot['elapsed_scenario_seconds'] = current_time - scenario_start
+                
+                all_metrics.append(snapshot)
+                
+                # Print status update
+                frontend = snapshot['services']['frontend']
+                cart = snapshot['services']['cartservice']
+                req = snapshot['requests']
+                
+                elapsed = int(current_time - scenario_start)
+                print(f"  [{elapsed:3d}s/{scenario['duration']}s] "
+                      f"Users:{scenario['users']:4d} | "
+                      f"Frontend:{frontend['replicas_ordered']:2d}({frontend['replicas_ready']:2d}) | "
+                      f"Cart:{cart['replicas_ordered']:2d}({cart['replicas_ready']:2d}) | "
+                      f"RPS:{req['throughput_rps']:6.1f} | "
+                      f"P95:{req['p95_response_time_ms']:7.1f}ms | "
+                      f"Faults:{req['fault_rate_percent']:4.2f}%")
+                
+                next_collection += collection_interval
             
-            # Print status
-            frontend = snapshot['services']['frontend']
-            cart = snapshot['services']['cartservice']
-            req = snapshot['requests']
-            
-            # Get Locust stats if available
-            locust_info = ""
-            if LOCUST_AUTOMATED:
-                locust_stats = get_locust_stats()
-                if locust_stats and 'user_count' in locust_stats:
-                    locust_info = f"Locust:{locust_stats['user_count']:4d} | "
-            
-            print(f"  [{int(time.time() - scenario_start):3d}s] "
-                  f"{locust_info}"
-                  f"Frontend:{frontend['replicas_ordered']:2d}({frontend['replicas_ready']:2d}) | "
-                  f"Cart:{cart['replicas_ordered']:2d}({cart['replicas_ready']:2d}) | "
-                  f"RPS:{req['throughput_rps']:6.1f} | "
-                  f"P95:{req['p95_response_time_ms']:7.1f}ms | "
-                  f"Faults:{req['fault_rate_percent']:4.2f}%")
-            
-            time.sleep(interval)
+            # Sleep briefly to avoid busy waiting
+            time.sleep(1)
         
-        elapsed_minutes += scenario['duration'] / 60
-    
-    # Stop load at end of experiment
-    if LOCUST_AUTOMATED:
-        print(f"\n🛑 Stopping Locust load...")
-        stop_locust_load()
+        # Stop load test
+        stop_load_test()
+        
+        # Wait between scenarios (except after last one)
+        if scenario_number < len(load_scenarios):
+            print(f"\nWaiting 30s before next scenario...")
+            time.sleep(30)
     
     print(f"\n✓ Experiment complete: {config_name}")
+    print(f"  Total snapshots collected: {len(all_metrics)}")
+    
     return all_metrics
 
-def apply_hpa_config(config_type):
+def run_comparative_experiments():
     """
-    Apply HPA configuration
-    config_type: 'baseline' or 'elascale'
+    Run BOTH baseline and elascale experiments sequentially
     """
-    print(f"\nApplying {config_type} HPA configuration...")
+    print(f"\n{'='*70}")
+    print("EECS6446 PROJECT - COMPARATIVE EXPERIMENT")
+    print("Baseline HPA vs Elascale-Optimized HPA")
+    print(f"{'='*70}\n")
     
-    # Remove existing HPAs
-    print("  Removing existing HPAs...")
-    subprocess.run(
-        ["kubectl", "delete", "hpa", "--all", "-n", NAMESPACE],
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.DEVNULL,
-        check=False
-    )
+    all_results = {}
     
-    time.sleep(5)
+    # Run BASELINE experiment
+    print("\n" + "="*70)
+    print("PHASE 1/2: BASELINE HPA (CPU-only, 50% threshold)")
+    print("="*70)
+    baseline_results = run_single_experiment("baseline", LOAD_SCENARIOS)
+    all_results["baseline"] = baseline_results
     
-    if config_type == "baseline":
-        # Apply baseline (50% CPU threshold from report)
-        print("  Applying baseline HPA (50% CPU threshold)...")
-        
-        # You need to have baseline HPA YAML files ready
-        # If using files from GitHub repo:
-        baseline_path = "/home/common/EECS6446_project/files/optimizations/scaling/hpa_backup.yaml"
-        
-        if Path(baseline_path).exists():
-            result = subprocess.run(
-                ["kubectl", "apply", "-f", baseline_path],
-                capture_output=True, text=True, check=False
-            )
-            if result.returncode == 0:
-                print("  ✓ Baseline HPA applied")
-            else:
-                print(f"  ❌ Error: {result.stderr}")
-        else:
-            print(f"  ⚠️  Baseline HPA file not found: {baseline_path}")
-            print("  Please ensure baseline HPA YAML exists")
-            sys.exit(1)
-            
-    elif config_type == "elascale":
-        # Apply Elascale optimized HPA
-        print("  Applying Elascale HPA (multi-factor, optimized thresholds)...")
-        
-        elascale_paths = [
-            "/home/common/EECS6446_project/files/optimizations/scaling/cartservice-elascale-hpa.yaml",
-            "/home/common/EECS6446_project/files/optimizations/scaling/services-elascale-hpa.yaml"
-        ]
-        
-        for path in elascale_paths:
-            if Path(path).exists():
-                result = subprocess.run(
-                    ["kubectl", "apply", "-f", path],
-                    capture_output=True, text=True, check=False
-                )
-                if result.returncode == 0:
-                    print(f"  ✓ Applied: {Path(path).name}")
-                else:
-                    print(f"  ❌ Error applying {Path(path).name}: {result.stderr}")
-            else:
-                print(f"  ⚠️  File not found: {path}")
+    # CRITICAL: Stabilization period between configurations
+    print(f"\n{'='*70}")
+    print("STABILIZATION PERIOD")
+    print(f"{'='*70}")
+    print("Waiting 120s for cluster to return to steady state...")
+    print("This ensures fair comparison between configurations.")
+    time.sleep(120)
     
-    print("  Waiting 30s for HPA to initialize...")
-    time.sleep(30)
+    # Run ELASCALE experiment
+    print("\n" + "="*70)
+    print("PHASE 2/2: ELASCALE HPA (Multi-factor optimized)")
+    print("="*70)
+    elascale_results = run_single_experiment("elascale", LOAD_SCENARIOS)
+    all_results["elascale"] = elascale_results
+    
+    return all_results
+
 # ============================================================
 # Results Processing
 # ============================================================
-
-def flatten_and_save_results(metrics_list, config_name):
+def save_results(all_results):
     """
-    Flatten nested metrics structure and save to CSV
-    Matches baseline report structure
+    Save experimental results to CSV files
+    
+    Args:
+        all_results: Dictionary with "baseline" and "elascale" keys
     """
-    rows = []
+    print(f"\n{'='*70}")
+    print("SAVING RESULTS")
+    print(f"{'='*70}\n")
     
-    for snapshot in metrics_list:
-        # Base info
-        row = {
-            "timestamp": snapshot["timestamp"],
-            "config": snapshot["config"],
-            "scenario": snapshot["scenario"],
-            "scenario_users": snapshot["scenario_users"],
-            "elapsed_total_seconds": snapshot["elapsed_total_seconds"],
-            "elapsed_minutes": snapshot["elapsed_minutes"],
-        }
-        
-        # Request-level metrics
-        req = snapshot["requests"]
-        row.update({
-            "throughput_rps": req["throughput_rps"],
-            "avg_response_time_ms": req["avg_response_time_ms"],
-            "p95_response_time_ms": req["p95_response_time_ms"],
-            "fault_rate_percent": req["fault_rate_percent"],
-            "total_requests": req["total_requests"],
-        })
-        
-        # Service-specific metrics
-        for service, metrics in snapshot["services"].items():
-            row.update({
-                f"{service}_cpu_millicores": metrics["cpu_millicores"],
-                f"{service}_cpu_percent": metrics["cpu_util_percent"],
-                f"{service}_memory_bytes": metrics["memory_bytes"],
-                f"{service}_memory_percent": metrics["memory_util_percent"],
-                f"{service}_network_rx": metrics["network_rx_bytes_per_sec"],
-                f"{service}_network_tx": metrics["network_tx_bytes_per_sec"],
-                f"{service}_replicas_ordered": metrics["replicas_ordered"],
-                f"{service}_replicas_ready": metrics["replicas_ready"],
-            })
-        
-        rows.append(row)
-    
-    df = pd.DataFrame(rows)
-    
-    # Save to CSV
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = OUTPUT_DIR / f"{config_name}_complete_{timestamp}.csv"
-    df.to_csv(filename, index=False)
+    saved_files = []
     
-    print(f"\n✓ Results saved: {filename}")
-    return df, filename
+    for config_name, snapshots in all_results.items():
+        if not snapshots:
+            print(f"⚠️  No data for {config_name}, skipping...")
+            continue
+        
+        # Convert snapshots to DataFrame rows
+        rows = []
+        for snapshot in snapshots:
+            req = snapshot["requests"]
+            
+            row = {
+                "timestamp": snapshot["timestamp"],
+                "config": snapshot["config"],
+                "scenario": snapshot["scenario"],
+                "scenario_users": snapshot["scenario_users"],
+                "scenario_number": snapshot["scenario_number"],
+                "elapsed_total_seconds": snapshot["elapsed_total_seconds"],
+                "elapsed_scenario_seconds": snapshot["elapsed_scenario_seconds"],
+                "throughput_rps": req["throughput_rps"],
+                "avg_response_time_ms": req["avg_response_time_ms"],
+                "p95_response_time_ms": req["p95_response_time_ms"],
+                "fault_rate_percent": req["fault_rate_percent"],
+                "total_requests": req["total_requests"],
+            }
+            
+            # Service-specific metrics
+            for service, metrics in snapshot["services"].items():
+                row.update({
+                    f"{service}_cpu_millicores": metrics["cpu_millicores"],
+                    f"{service}_cpu_percent": metrics["cpu_util_percent"],
+                    f"{service}_memory_bytes": metrics["memory_bytes"],
+                    f"{service}_memory_percent": metrics["memory_util_percent"],
+                    f"{service}_network_rx": metrics["network_rx_bytes_per_sec"],
+                    f"{service}_network_tx": metrics["network_tx_bytes_per_sec"],
+                    f"{service}_replicas_ordered": metrics["replicas_ordered"],
+                    f"{service}_replicas_ready": metrics["replicas_ready"],
+                })
+            
+            rows.append(row)
+        
+        # Create DataFrame and save
+        df = pd.DataFrame(rows)
+        filename = OUTPUT_DIR / f"{config_name}_complete_{timestamp}.csv"
+        df.to_csv(filename, index=False)
+        
+        print(f"✓ Saved {config_name}: {filename}")
+        print(f"  - {len(rows)} data points")
+        print(f"  - {df['scenario'].nunique()} scenarios")
+        saved_files.append(filename)
+    
+    # Save combined file for easy comparison
+    combined_rows = []
+    for config_name, snapshots in all_results.items():
+        for snapshot in snapshots:
+            req = snapshot["requests"]
+            row = {
+                "timestamp": snapshot["timestamp"],
+                "config": snapshot["config"],
+                "scenario": snapshot["scenario"],
+                "scenario_users": snapshot["scenario_users"],
+                "elapsed_total_seconds": snapshot["elapsed_total_seconds"],
+                "throughput_rps": req["throughput_rps"],
+                "p95_response_time_ms": req["p95_response_time_ms"],
+                "fault_rate_percent": req["fault_rate_percent"],
+            }
+            
+            # Add key service metrics
+            for service in ["frontend", "cartservice"]:
+                metrics = snapshot["services"][service]
+                row.update({
+                    f"{service}_replicas_ordered": metrics["replicas_ordered"],
+                    f"{service}_replicas_ready": metrics["replicas_ready"],
+                    f"{service}_cpu_percent": metrics["cpu_util_percent"],
+                })
+            
+            combined_rows.append(row)
+    
+    combined_df = pd.DataFrame(combined_rows)
+    combined_filename = OUTPUT_DIR / f"comparative_summary_{timestamp}.csv"
+    combined_df.to_csv(combined_filename, index=False)
+    
+    print(f"\n✓ Saved combined comparison: {combined_filename}")
+    saved_files.append(combined_filename)
+    
+    print(f"\n{'='*70}\n")
+    
+    return saved_files
+# ============================================================
+# System Checks
+# ============================================================
+
 def check_prerequisites():
     """Check all prerequisites before running experiment"""
     print(f"\n{'='*60}")
-    print("System Prerequisites Check")
+    print("SYSTEM PREREQUISITES CHECK")
     print(f"{'='*60}\n")
     
     checks_passed = True
@@ -588,28 +600,29 @@ def check_prerequisites():
     
     # Check Locust
     print("\n3. Checking Locust availability...")
-    if LOCUST_AUTOMATED:
-        if check_locust_ready():
-            print(f"   ✓ Locust accessible at {LOCUST_URL}")
-            print("   ✓ Automated load control enabled")
+    try:
+        response = requests.get(LOCUST_URL, timeout=5)
+        print("   ✓ Locust web UI accessible")
+    except:
+        print("   ❌ Locust not accessible at http://localhost:8089")
+        print("   Make sure Locust is running:")
+        print("   1. kubectl port-forward svc/frontend 8080:8080 -n default")
+        print("   2. locust -f locustfile.py --host=http://localhost:8080")
+        checks_passed = False
+    
+    # Check Locust API
+    print("\n4. Checking Locust API...")
+    try:
+        stats = get_locust_stats()
+        if stats:
+            print("   ✓ Locust API responding")
         else:
-            print(f"   ❌ Locust not accessible at {LOCUST_URL}")
-            print("   To use automated control, start Locust with:")
-            print(f"     locust -f /path/to/locustfile.py --host={LOCUST_HOST} --web-port=8089")
-            print("   OR set LOCUST_AUTOMATED=False in the script for manual control")
-            checks_passed = False
-    else:
-        try:
-            response = requests.get(LOCUST_URL, timeout=5)
-            print(f"   ⚠️  Locust accessible (manual control mode)")
-            print("   You will need to manually adjust load during experiment")
-        except:
-            print(f"   ⚠️  Locust not accessible")
-            print("   Make sure to start Locust before running experiment")
-            print(f"     locust -f /path/to/locustfile.py --host={LOCUST_HOST} --web-port=8089")
+            print("   ⚠️  Locust API not responding (may need to start a test first)")
+    except:
+        print("   ⚠️  Cannot query Locust API")
     
     # Check services
-    print("\n4. Checking services deployment...")
+    print("\n5. Checking services deployment...")
     try:
         result = subprocess.run(
             ["kubectl", "get", "deployments", "-n", NAMESPACE],
@@ -627,104 +640,107 @@ def check_prerequisites():
             print(f"   ✓ All {len(SERVICES)} services deployed")
         else:
             print(f"   ⚠️  Missing services: {missing_services}")
+            checks_passed = False
     except:
         print("   ❌ Cannot check services")
         checks_passed = False
     
+    # Check HPA config files
+    print("\n6. Checking HPA configuration files...")
+    config_dir = Path("/home/common/EECS6446_project/files/optimizations/hpa_configs")
+    
+    baseline_dir = config_dir / "baseline"
+    elascale_dir = config_dir / "elascale"
+    
+    baseline_exists = baseline_dir.exists()
+    elascale_exists = elascale_dir.exists()
+    
+    if baseline_exists and elascale_exists:
+        print(f"   ✓ HPA config directories found")
+        print(f"     - Baseline: {baseline_dir}")
+        print(f"     - Elascale: {elascale_dir}")
+    else:
+        print(f"   ⚠️  HPA config directories missing:")
+        if not baseline_exists:
+            print(f"     - Missing: {baseline_dir}")
+        if not elascale_exists:
+            print(f"     - Missing: {elascale_dir}")
+        print("   Experiments may fail without proper HPA configs")
+    
     print(f"\n{'='*60}\n")
     
     if not checks_passed:
-        print("❌ Prerequisites check failed. Please fix issues before continuing.")
-        sys.exit(1)
+        print("❌ PREREQUISITES CHECK FAILED")
+        print("Please fix the issues above before continuing.\n")
+        return False
     
+    print("✓ ALL PREREQUISITES PASSED")
+    print("Ready to run experiments!\n")
     return True
 # ============================================================
 # Main Execution
 # ============================================================
 
 def main():
+    """Main execution function"""
     print(f"\n{'='*70}")
-    print("EECS6446 Project - Unified Experiment Framework")
-    print("Baseline HPA vs Elascale-Optimized HPA")
+    print("EECS6446 PROJECT - UNIFIED EXPERIMENT FRAMEWORK")
+    print("Automated Baseline vs Elascale Comparison")
     print(f"{'='*70}\n")
     
     # Check prerequisites
-    check_prerequisites()
-    
-    # Select configuration
-    print("Select experiment configuration:")
-    print("  1. Baseline (50% CPU threshold)")
-    print("  2. Elascale (multi-factor, optimized)")
-    print("  3. Both (run sequentially - takes ~40 minutes)")
-    
-    choice = input("\nEnter choice (1/2/3): ").strip()
-    
-    if choice not in ["1", "2", "3"]:
-        print("Invalid choice")
+    if not check_prerequisites():
         sys.exit(1)
     
-    print(f"\n{'='*60}")
-    print("IMPORTANT: Load Pattern Information")
-    print(f"{'='*60}")
-    print("\nThis experiment uses the exact load pattern from baseline:")
-    print("  - 50 users (1 min)")
-    print("  - 100 users (1 min)")
-    print("  - 500 users (1 min)")
-    print("  - 1000 users (3.5 min)")
-    print("  - 500 users (1 min)")
-    print("  - 100 users (1 min)")
-    print("\nTotal duration: ~10 minutes per configuration")
-    print(f"{'='*60}\n")
+    # Confirm with user before starting
+    print("This experiment will:")
+    print("  1. Run BASELINE HPA configuration (CPU-only, 50% threshold)")
+    print("  2. Wait 120s for stabilization")
+    print("  3. Run ELASCALE HPA configuration (multi-factor optimized)")
+    print("  4. Each configuration tests 6 load scenarios")
+    print(f"  5. Total estimated time: ~{(len(LOAD_SCENARIOS) * 2 * 90 + 120) / 60:.0f} minutes\n")
     
-    input("Press Enter when ready to begin...")
+    response = input("Continue with automated experiments? (yes/no): ").strip().lower()
+    if response not in ['yes', 'y']:
+        print("\nExperiment cancelled by user.")
+        sys.exit(0)
     
-    # Run experiments
-    all_results = {}
+    # Run comparative experiments
+    print("\nStarting automated experiments...")
+    all_results = run_comparative_experiments()
     
-    if choice in ["1", "3"]:
-        print("\n\n" + "="*70)
-        print("RUNNING BASELINE CONFIGURATION")
-        print("="*70)
-        baseline_metrics = run_experiment("baseline", LOAD_SCENARIOS)
-        baseline_df, baseline_file = flatten_and_save_results(baseline_metrics, "baseline")
-        all_results["baseline"] = {"df": baseline_df, "file": baseline_file}
-        
-        if choice == "3":
-            print("\nWaiting 120s before next configuration...")
-            time.sleep(120)
+    # Save results
+    saved_files = save_results(all_results)
     
-    if choice in ["2", "3"]:
-        print("\n\n" + "="*70)
-        print("RUNNING ELASCALE CONFIGURATION")
-        print("="*70)
-        elascale_metrics = run_experiment("elascale", LOAD_SCENARIOS)
-        elascale_df, elascale_file = flatten_and_save_results(elascale_metrics, "elascale")
-        all_results["elascale"] = {"df": elascale_df, "file": elascale_file}
-    
-    # Summary
-    print(f"\n\n{'='*70}")
+    # Print summary
+    print(f"\n{'='*70}")
     print("EXPERIMENT COMPLETE!")
     print(f"{'='*70}\n")
     
     print("Results saved to:")
-    for config, data in all_results.items():
-        print(f"  - {config}: {data['file']}")
+    for filepath in saved_files:
+        print(f"  - {filepath}")
     
-    print(f"\nOutput directory: {OUTPUT_DIR}/")
-    
-    print("\n" + "="*70)
-    print("NEXT STEPS")
-    print("="*70)
-    print("\n1. Generate comparison visualizations:")
-    print(f"   python3 /home/claude/generate_unified_comparison.py")
-    print("\n2. Analyze results in detail:")
-    print("   - Check CSV files for raw data")
-    print("   - Compare metrics against baseline report")
-    print("\n3. Create final report with:")
-    print("   - Performance improvements")
-    print("   - Scaling behavior differences")
-    print("   - Resource utilization comparison")
+    print("\nNext steps:")
+    print("1. Analyze results in Jupyter notebook:")
+    print("   jupyter notebook /home/common/EECS6446_project/files/optimizations/analysis/elascale_analysis.ipynb")
+    print("\n2. Generate comparison visualizations:")
+    print("   python3 /home/common/EECS6446_project/files/optimizations/scripts/generate_comparison_plots.py")
     print(f"\n{'='*70}\n")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n❌ Experiment interrupted by user (Ctrl+C)")
+        print("Attempting to stop Locust...")
+        stop_load_test()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\n❌ Experiment failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\nAttempting to stop Locust...")
+        stop_load_test()
+        sys.exit(1)
+
