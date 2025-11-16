@@ -57,6 +57,11 @@ def load_latest_results(config_name):
     print(f"✓ Loading {config_name}: {latest.name}")
     
     df = pd.read_csv(latest)
+    
+    # Calculate elapsed_minutes from elapsed_total_seconds
+    if 'elapsed_total_seconds' in df.columns:
+        df['elapsed_minutes'] = df['elapsed_total_seconds'] / 60.0
+    
     return df
 
 # ============================================================
