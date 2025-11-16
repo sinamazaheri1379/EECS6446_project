@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-EECS6446 Project - Unified Experiment Framework
-Measures ALL baseline metrics for Baseline HPA vs Elascale-Optimized HPA
+EECS6446 Project - Unified Experiment Framework (FIXED VERSION)
+Automatically compares Baseline HPA vs Elascale-Optimized HPA
+
+Key improvements:
+- Automated Locust control (no manual intervention)
+- Runs BOTH configurations sequentially
+- Proper stabilization waits
+- Comprehensive metrics collection
+- Comparative analysis output
 
 Metrics collected (matching baseline report):
 - User load over time
@@ -64,7 +71,7 @@ SERVICE_WEIGHTS = {
 }
 
 # ============================================================
-# Locust Automation Functions
+# Locust Control Functions (AUTOMATED)
 # ============================================================
 
 def start_load_test(users, spawn_rate):
@@ -262,33 +269,42 @@ def apply_hpa_config(config_type):
     print(f"Applying HPA Configuration: {config_type.upper()}")
     print(f"{'='*60}\n")
     
-    config_dir = Path("/home/common/EECS6446_project/files/optimizations/hpa_configs")
+    scaling_dir = Path("/home/common/EECS6446_project/files/optimizations/scaling")
     
     if config_type == "baseline":
         # Apply baseline CPU-only HPA (50% threshold)
-        for service in SERVICES:
-            hpa_file = config_dir / "baseline" / f"{service}-hpa.yaml"
-            if hpa_file.exists():
-                try:
-                    result = subprocess.run(
-                        ["kubectl", "apply", "-f", str(hpa_file)],
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
-                    if result.returncode == 0:
-                        print(f"   ✓ Applied baseline HPA for {service}")
-                    else:
-                        print(f"   ❌ Failed to apply {service}: {result.stderr}")
-                except Exception as e:
-                    print(f"   ❌ Error applying {service}: {e}")
-            else:
-                print(f"   ⚠️  HPA file not found: {hpa_file}")
+        # Baseline is a single file containing all service HPAs
+        hpa_file = scaling_dir / "hpa_backup.yaml"
+        
+        if hpa_file.exists():
+            try:
+                result = subprocess.run(
+                    ["kubectl", "apply", "-f", str(hpa_file)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode == 0:
+                    print(f"   ✓ Applied baseline HPA configuration")
+                    print(f"     File: {hpa_file}")
+                else:
+                    print(f"   ❌ Failed to apply baseline HPA: {result.stderr}")
+            except Exception as e:
+                print(f"   ❌ Error applying baseline HPA: {e}")
+        else:
+            print(f"   ❌ Baseline HPA file not found: {hpa_file}")
+            print(f"   Please ensure the file exists before running the experiment")
     
     elif config_type == "elascale":
         # Apply Elascale multi-factor HPA
-        for service in SERVICES:
-            hpa_file = config_dir / "elascale" / f"{service}-hpa.yaml"
+        # Elascale has two files: one for cartservice, one for other services
+        elascale_files = [
+            scaling_dir / "cartservice-elascale-hpa.yaml",
+            scaling_dir / "services-elascale-hpa.yaml"
+        ]
+        
+        success_count = 0
+        for hpa_file in elascale_files:
             if hpa_file.exists():
                 try:
                     result = subprocess.run(
@@ -298,13 +314,21 @@ def apply_hpa_config(config_type):
                         check=False
                     )
                     if result.returncode == 0:
-                        print(f"   ✓ Applied elascale HPA for {service}")
+                        print(f"   ✓ Applied {hpa_file.name}")
+                        success_count += 1
                     else:
-                        print(f"   ❌ Failed to apply {service}: {result.stderr}")
+                        print(f"   ❌ Failed to apply {hpa_file.name}: {result.stderr}")
                 except Exception as e:
-                    print(f"   ❌ Error applying {service}: {e}")
+                    print(f"   ❌ Error applying {hpa_file.name}: {e}")
             else:
                 print(f"   ⚠️  HPA file not found: {hpa_file}")
+        
+        if success_count == len(elascale_files):
+            print(f"\n   ✓ All Elascale HPA configurations applied successfully")
+        elif success_count > 0:
+            print(f"\n   ⚠️  Partial success: {success_count}/{len(elascale_files)} files applied")
+        else:
+            print(f"\n   ❌ Failed to apply Elascale HPA configurations")
     
     print(f"\n{'='*60}\n")
 
@@ -447,8 +471,9 @@ def run_comparative_experiments():
     return all_results
 
 # ============================================================
-# Results Processing
+# Results Saving
 # ============================================================
+
 def save_results(all_results):
     """
     Save experimental results to CSV files
@@ -550,6 +575,7 @@ def save_results(all_results):
     print(f"\n{'='*70}\n")
     
     return saved_files
+
 # ============================================================
 # System Checks
 # ============================================================
@@ -647,25 +673,41 @@ def check_prerequisites():
     
     # Check HPA config files
     print("\n6. Checking HPA configuration files...")
-    config_dir = Path("/home/common/EECS6446_project/files/optimizations/hpa_configs")
+    scaling_dir = Path("/home/common/EECS6446_project/files/optimizations/scaling")
     
-    baseline_dir = config_dir / "baseline"
-    elascale_dir = config_dir / "elascale"
+    baseline_file = scaling_dir / "hpa_backup.yaml"
+    elascale_files = [
+        scaling_dir / "cartservice-elascale-hpa.yaml",
+        scaling_dir / "services-elascale-hpa.yaml"
+    ]
     
-    baseline_exists = baseline_dir.exists()
-    elascale_exists = elascale_dir.exists()
+    hpa_files_ok = True
     
-    if baseline_exists and elascale_exists:
-        print(f"   ✓ HPA config directories found")
-        print(f"     - Baseline: {baseline_dir}")
-        print(f"     - Elascale: {elascale_dir}")
+    # Check baseline HPA
+    if baseline_file.exists():
+        print(f"   ✓ Baseline HPA found: {baseline_file.name}")
     else:
-        print(f"   ⚠️  HPA config directories missing:")
-        if not baseline_exists:
-            print(f"     - Missing: {baseline_dir}")
-        if not elascale_exists:
-            print(f"     - Missing: {elascale_dir}")
-        print("   Experiments may fail without proper HPA configs")
+        print(f"   ❌ Baseline HPA missing: {baseline_file}")
+        hpa_files_ok = False
+        checks_passed = False
+    
+    # Check Elascale HPAs
+    missing_elascale = []
+    for hpa_file in elascale_files:
+        if hpa_file.exists():
+            print(f"   ✓ Elascale HPA found: {hpa_file.name}")
+        else:
+            missing_elascale.append(hpa_file.name)
+            hpa_files_ok = False
+            checks_passed = False
+    
+    if missing_elascale:
+        print(f"   ❌ Elascale HPAs missing: {', '.join(missing_elascale)}")
+    
+    if not hpa_files_ok:
+        print(f"\n   ⚠️  HPA configuration files are required for the experiment")
+        print(f"   Please ensure all HPA YAML files exist in:")
+        print(f"   {scaling_dir}")
     
     print(f"\n{'='*60}\n")
     
@@ -677,6 +719,7 @@ def check_prerequisites():
     print("✓ ALL PREREQUISITES PASSED")
     print("Ready to run experiments!\n")
     return True
+
 # ============================================================
 # Main Execution
 # ============================================================
@@ -743,4 +786,3 @@ if __name__ == "__main__":
         print("\nAttempting to stop Locust...")
         stop_load_test()
         sys.exit(1)
-
