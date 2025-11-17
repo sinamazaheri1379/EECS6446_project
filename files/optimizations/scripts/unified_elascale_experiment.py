@@ -50,6 +50,51 @@ COLLECTION_INTERVAL = 2  # Collect every 2 seconds (like notebook WorkerThread)
 SERVICES = ["frontend", "cartservice", "checkoutservice", 
             "currencyservice", "recommendationservice", "productcatalogservice"]
 
+
+class ElascaleWatermarkEnhancement:
+    """Add watermark thresholds to Elascale"""
+    
+    def __init__(self):
+        self.watermarks = {
+            'cartservice': {
+                'high': 0.45,  # Your aggressive threshold
+                'low': 0.25,
+                'tolerance': 0.05
+            },
+            'frontend': {
+                'high': 0.40,
+                'low': 0.20,
+                'tolerance': 0.05
+            }
+        }
+        self.velocity_limits = {
+            'scale_up_factor': 1.5,    # Max 150% increase
+            'scale_down_factor': 0.3   # Max 30% decrease
+        }
+    
+    def apply_watermark_logic(self, service, current_score, current_replicas):
+        """Apply watermark with tolerance bands"""
+        wm = self.watermarks[service]
+        
+        # Check if we're in tolerance band
+        if (wm['high'] - wm['tolerance']) < current_score < (wm['high'] + wm['tolerance']):
+            return 'maintain', 0  # In tolerance band, don't scale
+            
+        if current_score > wm['high']:
+            # Calculate velocity-limited scale-up
+            max_scale = int(current_replicas * self.velocity_limits['scale_up_factor'])
+            desired = min(max_scale, current_replicas + 3)  # Your aggressive +3
+            return 'scale_up', desired - current_replicas
+            
+        elif current_score < wm['low']:
+            # Conservative scale-down
+            min_scale = int(current_replicas * self.velocity_limits['scale_down_factor'])
+            desired = max(min_scale, current_replicas - 1)
+            return 'scale_down', current_replicas - desired
+            
+        return 'maintain', 0
+
+
 # ============================================================
 # Live Data Collector (like PACSLoadTester WorkerThread)
 # ============================================================
