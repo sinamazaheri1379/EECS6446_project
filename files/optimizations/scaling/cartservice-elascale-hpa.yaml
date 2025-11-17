@@ -1,69 +1,34 @@
+# services-elascale-hpa-optimized.yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: cartservice-elascale
-  namespace: default
-  labels:
-    optimization: elascale-fixed
-    service: cartservice
-  annotations:
-    description: "Fixed Elascale HPA for cartservice - Redis bottleneck aware"
-    formula: "f = 0.3·CPU + 0.4·MEM + 0.3·REP (Redis-aware)"
-    strategy: "Aggressive scale-up to combat contribution time, Redis 3:1 ratio"
+  name: cartservice-elascale-optimized
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: cartservice
-  
-  # CRITICAL FIX: Higher minimum for Redis load distribution
-  minReplicas: 3  # Start with 3 (not 2) for Redis 3:1 ratio
+  minReplicas: 2  # As you specified
   maxReplicas: 15
-  
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Immediate response
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 180  # More conservative
   metrics:
-  # CPU Utilization - α = 0.3
-  # FIX: Increased threshold from 60% to 65% (closer to baseline 70%)
   - type: Resource
     resource:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 65  # Was 60%, now 65%
-  
-  # Memory Utilization - β = 0.4 (highest weight)
-  # FIX: Lowered from 65% to 60% (memory more critical for cart data)
+        averageUtilization: 45  # Your aggressive threshold
   - type: Resource
     resource:
       name: memory
       target:
         type: Utilization
-        averageUtilization: 60  # Was 65%, now 60%
-  
-  behavior:
-    scaleUp:
-      # AGGRESSIVE scale-up for contribution time problem
-      # FIX: Reduced stabilization from 30s to 0s for immediate response
-      stabilizationWindowSeconds: 0  # Was 30s, now INSTANT
-      policies:
-      # FIX: Reduced from +3 pods to +2 pods (less aggressive)
-      - type: Pods
-        value: 2  # Was 3, now 2
-        periodSeconds: 15  # Was 30s, now 15s (faster checks)
-      - type: Percent
-        value: 100  # Double capacity
-        periodSeconds: 15
-      selectPolicy: Max  # Most aggressive policy wins
-    
-    scaleDown:
-      # CONSERVATIVE scale-down to maintain Redis ratio
-      # FIX: Increased stabilization from 300s to 420s (7 minutes)
-      stabilizationWindowSeconds: 420  # Was 300s, now 420s
-      policies:
-      # Very conservative: only -1 pod at a time
-      - type: Pods
-        value: 1
-        periodSeconds: 180  # Was 120s, now 180s
-      - type: Percent
-        value: 5  # Maximum 5% reduction (was 10%)
-        periodSeconds: 180
-      selectPolicy: Min  # Most conservative policy wins
+        averageUtilization: 50
