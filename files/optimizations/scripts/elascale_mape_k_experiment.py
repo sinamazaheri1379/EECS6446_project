@@ -42,6 +42,76 @@ SERVICE_WEIGHTS = {
     "recommendationservice": {"alpha": 0.6, "beta": 0.4, "gamma": 0.0, "lambda": 0.0},
 }
 
+SERVICE_CONFIGS = {
+    'cartservice': {
+        'weights': {
+            'cpu': 0.35,      # α
+            'memory': 0.25,   # β
+            'network': 0.15,  # γ
+            'replication': 0.25  # λ
+        },
+        'thresholds': {
+            'scale_up': 0.45,    # Aggressive 45%
+            'scale_down': 0.25,
+            'panic': 0.60        # Emergency scaling
+        },
+        'min_replicas': 2,
+        'max_replicas': 15
+    },
+    'frontend': {
+        'weights': {
+            'cpu': 0.30,
+            'memory': 0.20,
+            'network': 0.30,
+            'replication': 0.20
+        },
+        'thresholds': {
+            'scale_up': 0.40,    # Aggressive 40%
+            'scale_down': 0.20,
+            'panic': 0.55
+        },
+        'min_replicas': 3,
+        'max_replicas': 25,
+        'scale_increment': 3     # Aggressive scale-up
+    }
+}
+
+def analyze_compute_score_enhanced(metrics, service):
+    """Enhanced multi-factor scoring with service-specific configs"""
+    config = SERVICE_CONFIGS[service]
+    weights = config['weights']
+    
+    # Original Elascale formula with service-specific weights
+    score = (
+        weights['cpu'] * metrics['cpu_usage'] +
+        weights['memory'] * metrics['memory_usage'] +
+        weights['network'] * metrics['network_usage'] +
+        weights['replication'] * metrics['replication_factor']
+    )
+    
+    # Add dependency factor for cartservice (Redis dependency)
+    if service == 'cartservice':
+        redis_health = get_redis_health_score()
+        score = score * 0.8 + redis_health * 0.2
+    
+    return score
+
+def plan_determine_action_enhanced(service, score):
+    """Enhanced planning with aggressive thresholds"""
+    config = SERVICE_CONFIGS[service]
+    thresholds = config['thresholds']
+    
+    if score > thresholds['panic']:
+        # Emergency scaling - double the replicas
+        return 'emergency_scale', config.get('scale_increment', 2) * 2
+    elif score > thresholds['scale_up']:
+        # Aggressive scale-up
+        return 'scale_up', config.get('scale_increment', 1)
+    elif score < thresholds['scale_down']:
+        return 'scale_down', 1
+    else:
+        return 'maintain', 0
+
 # ============================================================
 # MAPE-K Loop Implementation
 # ============================================================
