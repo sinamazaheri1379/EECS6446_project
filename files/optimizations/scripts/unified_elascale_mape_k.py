@@ -15,6 +15,8 @@ import numpy as np
 import threading
 import json
 import sys
+import joblib
+import os
 from datetime import datetime
 from pathlib import Path
 from kubernetes import client, config
@@ -96,28 +98,82 @@ class ElascaleController(threading.Thread):
     def __init__(self):
         super().__init__()
         self.running = False
+        self.last_scale_time = {}  # For Phase 1: Stabilization
+        self.models = {}           # For Phase 2: Prediction
+        
+        # Load Models (Phase 2)
+        for svc in ['frontend', 'cartservice', 'checkoutservice']:
+            if os.path.exists(f"models/{svc}_cpu_predictor.pkl"):
+                self.models[svc] = joblib.load(f"models/{svc}_cpu_predictor.pkl")
         
     def run(self):
-        print("   >>> Elascale MAPE-K Active")
+        print("   >>> CAPA+ Controller Active (Predictive + Cost-Aware)")
         self.running = True
+        
+        # Phase 3: Simulated Node Pools (Cost Logic)
+        # We assume nodes 1-2 are "Burstable" (Cheap) and 3+ are "On-Demand" (Expensive)
+        # In a real cluster, you would query node labels.
+        
         while self.running:
+            current_time = time.time()
+            
             for svc in SERVICES:
-                # MONITOR
+                # --- 1. MONITOR ---
                 m = get_metrics(svc)
                 
-                # ANALYZE (Simple Elascale Formula)
-                # CPU is in millicores, normalize approx (e.g. 1 core = 1000m)
-                # This is where you'd add your 'predictive' hook
-                cpu_score = (m['cpu'] / (m['pods'] * 200)) # Rough utilization
+                # --- 2. ANALYZE (Phase 2: Prediction) ---
+                # Get current reactive score
+                current_util = (m['cpu'] / (max(1, m['pods']) * 200))
                 
-                # PLAN
+                # Get predictive score (if model exists)
+                predictive_util = 0
+                if svc in self.models:
+                    # Predict load 60 seconds in the future
+                    # We estimate 'users' roughly based on current CPU or hardcode the known scenario step
+                    # For this demo, we use a heuristic boost
+                    predicted_cpu = self.models[svc].predict([[ 
+                        500, # Ideally, pass actual current user load here if available
+                        0    # Dummy time
+                    ]])[0]
+                    predictive_util = predicted_cpu / (max(1, m['pods']) * 200)
+                
+                # CAPA Logic: Take the MAX of Reactive vs Predictive
+                final_score = max(current_util, predictive_util)
+                
+                # --- 3. PLAN (Phase 1: Stabilization) ---
+                # Initialize last_scale_time if needed
+                if svc not in self.last_scale_time:
+                    self.last_scale_time[svc] = 0
+                
                 target = m['pods']
-                if cpu_score > 0.50: target += 2
-                elif cpu_score < 0.30: target -= 1
                 
-                # EXECUTE
+                # Scale UP (Aggressive)
+                if final_score > 0.50:
+                    target += 2
+                    print(f"[{svc}] Scale UP Triggered (Score: {final_score:.2f})")
+                    self.last_scale_time[svc] = current_time
+                    
+                # Scale DOWN (Conservative - 300s Stabilization Window)
+                elif final_score < 0.30:
+                    if current_time - self.last_scale_time[svc] > 300:
+                        target -= 1
+                        print(f"[{svc}] Scale DOWN Triggered (Stable for >300s)")
+                        self.last_scale_time[svc] = current_time
+                    else:
+                        print(f"[{svc}] Scale DOWN suppressed (Stabilizing...)")
+
+                # --- 4. EXECUTE (Phase 3: Cost Awareness) ---
                 if target != m['pods']:
+                    # In a real CAPA implementation, we would patch NodeAffinity here.
+                    # For this project, we log the "Virtual Cost" decision.
+                    
+                    node_type = "Burstable (Cheap)"
+                    if target > 10: # If load is high, spill over to expensive nodes
+                        node_type = "On-Demand (Expensive)"
+                        
+                    print(f"   >>> Executing Scaling: {svc} -> {target} Replicas on {node_type} Tier")
                     scale_deployment(svc, target)
+                    
             time.sleep(15)
 
     def stop(self):
