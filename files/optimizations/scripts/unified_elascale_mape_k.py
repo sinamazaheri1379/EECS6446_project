@@ -131,7 +131,7 @@ def run_experiment_phase(config_name):
     
     # 1. Setup
     if config_name == "baseline":
-        subprocess.run("kubectl apply -f files/optimizations/scaling/hpa_backup.yaml", shell=True)
+        subprocess.run("kubectl apply -f ../scaling/hpa_backup.yaml", shell=True)
         controller = None
     else:
         subprocess.run("kubectl delete hpa --all", shell=True)
