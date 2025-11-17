@@ -131,10 +131,8 @@ class ElascaleController(threading.Thread):
                     # Predict load 60 seconds in the future
                     # We estimate 'users' roughly based on current CPU or hardcode the known scenario step
                     # For this demo, we use a heuristic boost
-                    predicted_cpu = self.models[svc].predict([[ 
-                        500, # Ideally, pass actual current user load here if available
-                        0    # Dummy time
-                    ]])[0]
+                    input_df = pd.DataFrame([[500, 0]], columns=['scenario_users', 'elapsed_total_seconds'])
+                    predicted_cpu = self.models[svc].predict(input_df)[0]
                     predictive_util = predicted_cpu / (max(1, m['pods']) * 200)
                 
                 # CAPA Logic: Take the MAX of Reactive vs Predictive
