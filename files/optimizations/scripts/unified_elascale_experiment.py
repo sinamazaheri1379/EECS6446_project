@@ -501,20 +501,44 @@ def run_progressive_load_experiment(config_name):
 # ============================================================
 # Results Saving
 # ============================================================
-def save_results(data_points, config_name):
-    """Save collected data to CSV"""
-    if not data_points:
-        print("No data to save")
-        return None
+def save_results(data, config_name):
+    df = pd.DataFrame(data)
     
-    df = pd.DataFrame(data_points)
+    # Column mappings for visualization compatibility
+    column_mappings = {
+        'user_count': 'scenario_users',
+        'total_rps': 'throughput_rps',
+        'fail_ratio': 'fault_rate_percent',
+        'avg_response_time': 'avg_response_time_ms',
+        'current_response_time_percentile_95': 'p95_response_time_ms'
+    }
+    
+    # Apply basic mappings
+    for old_col, new_col in column_mappings.items():
+        if old_col in df.columns:
+            df[new_col] = df[old_col]
+            if old_col == 'fail_ratio':
+                df[new_col] = df[new_col] * 100  # Convert to percentage
+    
+    # Map service-specific columns
+    for service in SERVICES:
+        # CPU columns
+        if f"{service}_cpu" in df.columns:
+            df[f"{service}_cpu_millicores"] = df[f"{service}_cpu"]
+        
+        # Pod count columns
+        if f"{service}_pods_total" in df.columns:
+            df[f"{service}_replicas_ordered"] = df[f"{service}_pods_total"]
+        if f"{service}_pods_ready" in df.columns:
+            df[f"{service}_replicas_ready"] = df[f"{service}_pods_ready"]
+    
+    # Add elapsed_minutes if not present
+    if 'elapsed_min' in df.columns:
+        df['elapsed_minutes'] = df['elapsed_min']
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = OUTPUT_DIR / f"{config_name}_results_{timestamp}.csv"
-    
+    filename = OUTPUT_DIR / f"{config_name}_complete_{timestamp}.csv"
     df.to_csv(filename, index=False)
-    print(f"✓ Data saved to: {filename}")
-    
     return filename
 
 # ============================================================
