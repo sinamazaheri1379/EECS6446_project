@@ -441,6 +441,62 @@ def update_plots(collector, plots, experiment_name):
     
     plt.tight_layout()
 
+# ================================================
+#
+# ================================================
+def run_enhanced_elascale_configuration():
+    """Run Elascale with all optimizations"""
+    
+    # Initialize enhanced components
+    predictive = ElascalePredictiveEnhancement()
+    watermark = ElascaleWatermarkEnhancement()
+    
+    # Apply the optimized HPA configurations
+    subprocess.run([
+        "kubectl", "apply", "-f", 
+        "services-elascale-hpa-optimized.yaml"
+    ])
+    
+    # Enhanced MAPE-K loop
+    while not experiment_complete:
+        # MONITOR - Existing
+        metrics = collect_complete_snapshot()
+        
+        # ANALYZE - Enhanced with prediction
+        for service in ['frontend', 'cartservice', 'checkoutservice']:
+            # Get enhanced score with prediction
+            score, score_details = predictive.enhance_elascale_decision(
+                metrics[service], service
+            )
+            
+            # PLAN - Enhanced with watermark logic  
+            current_replicas = get_replica_count(service)
+            action, delta = watermark.apply_watermark_logic(
+                service, score, current_replicas
+            )
+            
+            # Override with service-specific aggressive settings
+            if service == 'cartservice' and score > 0.45:
+                action, delta = 'scale_up', 2  # Aggressive
+            elif service == 'frontend' and score > 0.40:
+                action, delta = 'scale_up', 3  # Your specified +3
+            
+            # EXECUTE
+            if action != 'maintain':
+                execute_scaling_action(service, action, delta)
+                
+            # KNOWLEDGE - Store enhanced metrics
+            knowledge_store_results({
+                'service': service,
+                'reactive_score': score_details['reactive'],
+                'predictive_score': score_details['predictive'],
+                'final_score': score_details['final'],
+                'action': action,
+                'delta': delta,
+                'timestamp': datetime.now()
+            })
+        
+        time.sleep(30)  # 30-second loop
 # ============================================================
 # Progressive Load Pattern Execution
 # ============================================================
