@@ -1,68 +1,32 @@
 ---
-# Frontend Service HPA - FIXED VERSION
-# Formula: f = 0.5·CPU + 0.3·MEM + 0.2·REP (frontend-cart dependency)
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: frontend-elascale
-  namespace: default
-  labels:
-    optimization: elascale-fixed
-    service: frontend
-  annotations:
-    description: "User-facing service - network and CPU intensive"
-    formula: "f = 0.5·CPU + 0.3·MEM + 0.2·REP"
-    changes: "Increased CPU threshold from 55% to 68%, reduced max scale-up from 4 to 3 pods"
+  name: frontend-elascale-optimized
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: frontend
-  minReplicas: 2
-  maxReplicas: 20
-  
+  minReplicas: 3
+  maxReplicas: 25
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Pods
+        value: 3  # Aggressive scale-up as specified
+        periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
   metrics:
-  # FIX: Increased CPU from 55% to 68% (closer to baseline 70%)
   - type: Resource
     resource:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 68  # Was 55%, now 68%
-  
-  # Memory threshold appropriate for frontend
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 70
-  
-  behavior:
-    scaleUp:
-      # FIX: Added small stabilization window to prevent thrashing
-      stabilizationWindowSeconds: 15  # Was 20s, now 15s
-      policies:
-      # FIX: Reduced from +4 pods to +3 pods
-      - type: Pods
-        value: 3  # Was 4, now 3
-        periodSeconds: 30
-      - type: Percent
-        value: 100  # Double capacity
-        periodSeconds: 30
-      selectPolicy: Max
-    
-    scaleDown:
-      stabilizationWindowSeconds: 300  # 5 minutes
-      policies:
-      - type: Pods
-        value: 1
-        periodSeconds: 120
-      - type: Percent
-        value: 10
-        periodSeconds: 120
-      selectPolicy: Min
-
+        averageUtilization: 40  # Your specified threshold
 ---
 # Checkout Service HPA - FIXED VERSION
 # Formula: f = 0.6·CPU + 0.3·MEM + 0.1·REP
