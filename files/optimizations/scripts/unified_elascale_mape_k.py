@@ -289,6 +289,13 @@ class CAPAPlusController(threading.Thread):
             target = max(conf['min'], min(target, conf['max']))
             
             if target != m['pods']:
+                # --- NEW: Cost Awareness Logic ---
+                node_tier = "Burstable (Cheap)"
+                if target > 10:
+                    node_tier = "On-Demand (Expensive)"
+                print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
+                # ---------------------------------
+
                 scale_deployment(svc, target)
         
     def stop(self):
