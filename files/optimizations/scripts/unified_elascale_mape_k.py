@@ -341,7 +341,7 @@ def run_experiment_phase(config_name):
                     stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
-                    row["avg_response_time_ms"] = stats.get('current_response_time_percentile_95', 0) # Approx
+                    row["avg_response_time_ms"] = stats.get('avg_response_time', 0)
                     row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
                 except:
                     pass
