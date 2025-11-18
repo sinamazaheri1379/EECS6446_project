@@ -30,11 +30,6 @@ NAMESPACE = "default"
 OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-#SERVICES = [
-#   "frontend", "cartservice", "checkoutservice",
-#  "currencyservice", "recommendationservice", "productcatalogservice"
-#]
-
 # Configuration for MAPE-K logic
 SERVICE_CONFIGS = {
     "frontend": {
