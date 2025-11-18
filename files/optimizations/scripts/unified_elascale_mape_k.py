@@ -307,7 +307,7 @@ def run_experiment_phase(config_name):
         controller = None
     else:
         subprocess.run("kubectl delete hpa --all", shell=True)
-        controller = ElascaleController()
+        controller = CAPAPlusController()
         controller.start()
     
     time.sleep(10)
