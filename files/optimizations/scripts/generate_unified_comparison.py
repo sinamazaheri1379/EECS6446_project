@@ -76,8 +76,8 @@ def plot_user_load_and_throughput(baseline_df, elascale_df):
     
     # Plot 1: Throughput over time
     ax1 = axes[0]
-    for label, df, color in [("Baseline", baseline_df, 'C0'), 
-                              ("Elascale", elascale_df, 'C1')]:
+    for label, df, color in [("BaselineHPA", baseline_df, 'C0'), 
+                              ("CAPA+", elascale_df, 'C1')]:
         if df is not None:
             ax1.plot(df['elapsed_minutes'], df['throughput_rps'], 
                     label=label, linewidth=2, alpha=0.8, color=color)
@@ -121,8 +121,8 @@ def plot_fault_rate_and_response_time(baseline_df, elascale_df):
     
     # Plot 1: Fault Rate
     ax1 = axes[0]
-    for label, df, color in [("Baseline", baseline_df, 'C0'),
-                              ("Elascale", elascale_df, 'C1')]:
+    for label, df, color in [("BaselineHPA", baseline_df, 'C0'),
+                              ("CAPA+", elascale_df, 'C1')]:
         if df is not None:
             ax1.plot(df['elapsed_minutes'], df['fault_rate_percent'],
                     label=label, linewidth=2, alpha=0.8, color=color)
@@ -137,8 +137,8 @@ def plot_fault_rate_and_response_time(baseline_df, elascale_df):
     # Plot 2: Response Time (avg and p95)
     ax2 = axes[1]
     for label, df, color_avg, color_p95 in [
-        ("Baseline", baseline_df, 'C0', 'C3'),
-        ("Elascale", elascale_df, 'C1', 'C4')
+        ("BaselineHPA", baseline_df, 'C0', 'C3'),
+        ("CAPA+", elascale_df, 'C1', 'C4')
     ]:
         if df is not None:
             ax2.plot(df['elapsed_minutes'], df['avg_response_time_ms'],
@@ -149,7 +149,7 @@ def plot_fault_rate_and_response_time(baseline_df, elascale_df):
                     color=color_p95, linestyle='--')
     
     ax2.set_xlabel('Time (minutes)')
-    ax2.set_ylabel('Average Response Time (ms)')
+    ax2.set_ylabel('Response Time (ms)')
     ax2.set_title('Response Time Over Time')
     ax2.legend(fontsize=8)
     ax2.grid(alpha=0.3)
@@ -181,8 +181,8 @@ def plot_service_cpu_and_pods(baseline_df, elascale_df, service):
     
     # Plot 1: CPU Usage (millicores)
     ax1 = axes[0, 0]
-    for label, df, color in [("Baseline", baseline_df, 'C0'),
-                              ("Elascale", elascale_df, 'C1')]:
+    for label, df, color in [("BaselineHPA", baseline_df, 'C0'),
+                              ("CAPA+", elascale_df, 'C1')]:
         if df is not None and cpu_col in df.columns:
             ax1.plot(df['elapsed_minutes'], df[cpu_col],
                     label=label, linewidth=2, alpha=0.8, color=color)
@@ -232,8 +232,8 @@ def plot_service_cpu_and_pods(baseline_df, elascale_df, service):
     # Plot 4: Memory Usage
     ax4 = axes[1, 1]
     mem_col = f"{service}_memory_bytes"
-    for label, df, color in [("Baseline", baseline_df, 'C0'),
-                              ("Elascale", elascale_df, 'C1')]:
+    for label, df, color in [("BaselineHPA", baseline_df, 'C0'),
+                              ("CAPA+", elascale_df, 'C1')]:
         if df is not None and mem_col in df.columns:
             # Convert to MB
             mem_mb = df[mem_col] / (1024 * 1024)
@@ -263,7 +263,7 @@ def generate_summary_comparison(baseline_df, elascale_df):
     summary_rows = []
     
     # Overall metrics
-    for label, df in [("Baseline", baseline_df), ("Elascale", elascale_df)]:
+    for label, df in [("BaselineHPA", baseline_df), ("CAPA+", elascale_df)]:
         if df is not None:
             row = {
                 "Configuration": label,
@@ -327,7 +327,7 @@ def generate_service_summary(baseline_df, elascale_df):
         
         row = {"Service": service}
         
-        for label, df in [("Baseline", baseline_df), ("Elascale", elascale_df)]:
+        for label, df in [("BaselineHPA", baseline_df), ("CAPA+", elascale_df)]:
             if df is not None and cpu_col in df.columns:
                 row[f"{label} Avg CPU (mc)"] = f"{df[cpu_col].mean():.0f}"
                 row[f"{label} Max CPU (mc)"] = f"{df[cpu_col].max():.0f}"
