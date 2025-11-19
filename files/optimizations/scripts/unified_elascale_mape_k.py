@@ -341,10 +341,11 @@ def run_experiment_phase(config_name):
                     stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
-                    row["avg_response_time_ms"] = stats.get('avg_response_time', 0)
+                    total_entry = next((s for s in stats.get('stats', []) if s['name'] == 'Total'), None)
+                    row["avg_response_time_ms"] = total_entry.get('avg_response_time', 0) if total_entry else 0
                     row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
-                except:
-                    pass
+                except Exception as e:  # <--- FIXED: Added 'Exception as e'
+                    print(f"Locust stats error: {e}")
 
                 # Service Data (Formatted for generate_unified_comparison.py)
                 for svc in SERVICES:
@@ -352,9 +353,11 @@ def run_experiment_phase(config_name):
                     row[f"{svc}_cpu_millicores"] = m['cpu']
                     row[f"{svc}_memory_bytes"] = m['mem']
                     row[f"{svc}_replicas_ordered"] = m['pods']
-                    row[f"{svc}_replicas_ready"] = m['pods'] # Simplifying for speed
-                    # Fake calculating percent for the chart
-                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (m['pods']*250)) * 100 if m['pods'] > 0 else 0
+                    row[f"{svc}_replicas_ready"] = m['pods'] 
+                    
+                    # FIX: Use the actual configured limit (200) instead of hardcoded 250
+                    limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
+                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (m['pods'] * limit)) * 100 if m['pods'] > 0 else 0
                 
                 rows.append(row)
                 time.sleep(5) # Sample rate
