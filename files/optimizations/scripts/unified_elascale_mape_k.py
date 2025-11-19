@@ -149,7 +149,8 @@ def get_metrics(service):
             scale = k8s_apps.read_namespaced_deployment_scale(service, NAMESPACE)
             m['pods'] = int(scale.status.replicas)
             # Note: ready_replicas can be None if 0 are ready
-            m['ready_pods'] = int(scale.status.ready_replicas) if scale.status.ready_replicas else 0
+            ready = getattr(scale.status, 'ready_replicas', 0)
+            m['ready_pods'] = int(ready) if ready is not None else 0
             
     except Exception as e:
         print(f"Metrics error for {service}: {e}")
