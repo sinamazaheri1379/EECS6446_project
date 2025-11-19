@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-EECS6446 Project - Unified Elascale MAPE-K Experiment (Optimized Level 4)
--------------------------------------------------------------------------
+EECS6446 Project - Unified Elascale MAPE-K Experiment (Robust & Validated)
+--------------------------------------------------------------------------
 1. Runs Notebook-style continuous load (50->1000->50 users)
-2. Runs custom MAPE-K Loop logic:
-   - Multi-Metric Analysis (CPU, Memory, Latency)
-   - Predictive Scaling (Machine Learning)
-   - Cost-Aware Execution (Burstable vs On-Demand Tiers)
+2. Runs custom MAPE-K Loop logic with critical robustness fixes:
+   - Weighted Average Strategy (Stable Scaling)
+   - Robust Metric Collection (Handles missing data)
+   - Ready-Replicas Logic (Prevents death spirals)
 3. Outputs data compatible with 'generate_unified_comparison.py'
 """
 
@@ -121,32 +121,36 @@ except:
     print("⚠️ K8s config not found")
 
 def get_metrics(service):
-    """Get metrics with proper error handling"""
-    m = {'cpu': 0.0, 'mem': 0.0, 'pods': 0, 'latency': 0.0} # Added latency
+    """Get metrics with proper error handling (Priority 2 Fix)"""
+    m = {'cpu': 0.0, 'mem': 0.0, 'pods': 0, 'ready_pods': 0, 'latency': 0.0}
     try:
         # CPU Millicores
         q_cpu = f'sum(rate(container_cpu_usage_seconds_total{{pod=~"{service}-.*",namespace="{NAMESPACE}"}}[1m])) * 1000'
         res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_cpu}, timeout=5).json()
-        if res['data']['result']:
+        if res.get('data', {}).get('result'):
             m['cpu'] = float(res['data']['result'][0]['value'][1])
 
         # Memory Bytes
         q_mem = f'sum(container_memory_usage_bytes{{pod=~"{service}-.*",namespace="{NAMESPACE}"}})'
         res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_mem}, timeout=5).json()
-        if res['data']['result']:
+        if res.get('data', {}).get('result'):
             m['mem'] = float(res['data']['result'][0]['value'][1])
 
-        # [NEW] Latency (P95 in seconds)
-        # Note: Using 'request_duration_seconds' which is standard for microservices demo
+        # Latency (P95) - Priority 2: Add check for empty result
         q_lat = f'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{app="{service}",namespace="{NAMESPACE}"}}[1m])) by (le))'
         res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_lat}, timeout=5).json()
-        if res['data']['result']:
+        if res.get('data', {}).get('result'):
             m['latency'] = float(res['data']['result'][0]['value'][1])
+        else:
+            m['latency'] = 0.0
 
-        # Pod Count
+        # Pod Count - Priority 3: Get Ready Replicas
         if k8s_apps:
             scale = k8s_apps.read_namespaced_deployment_scale(service, NAMESPACE)
             m['pods'] = int(scale.status.replicas)
+            # Note: ready_replicas can be None if 0 are ready
+            m['ready_pods'] = int(scale.status.ready_replicas) if scale.status.ready_replicas else 0
+            
     except Exception as e:
         print(f"Metrics error for {service}: {e}")
     
@@ -200,12 +204,10 @@ class CAPAPlusController(threading.Thread):
                     print(f"   ✗ Model load error for {svc}: {e}")
         
     def run(self):
-        print("\n>>> CAPA+ Controller Started (Multi-Metric + Predictive + Cost-Aware) <<<")
-        print("Optimization Features Active:")
-        print("  - [Metric] Scaling on CPU, Memory, AND Latency (Golden Signals)")
-        print("  - [Predict] Dynamic User Load Forecasting")
-        print("  - [Cost] Tiered Node Logic (Burstable vs On-Demand)")
-        print("  - [Stability] Anti-Oscillation Hysteresis\n")
+        print("\n>>> CAPA+ Controller Started (Robustness Improvements Applied) <<<")
+        print("  - [Fix 1] Metric Validation (Handles empty/missing data)")
+        print("  - [Fix 2] Provisioning Awareness (Uses Ready Pods)")
+        print("  - [Logic] Weighted Average Strategy (Stability-Focused)\n")
         self.running = True
         
         while self.running:
@@ -233,40 +235,40 @@ class CAPAPlusController(threading.Thread):
         
         # --- ANALYZE (Level 4: Multi-Metric) ---
         
+        # Priority 3 Fix: Use Ready Pods for capacity calculation to avoid death spirals
+        active_capacity_count = max(1, m['ready_pods'])
+        
         # 1. CPU Score
         cpu_limit = conf['cpu_limit_millicores']
-        score_cpu = m['cpu'] / (max(1, m['pods']) * cpu_limit)
+        score_cpu = m['cpu'] / (active_capacity_count * cpu_limit)
         
-        # 2. Memory Score (New)
-        mem_limit = conf.get('mem_limit_bytes', 500000000) # Default 500MB
-        score_mem = m['mem'] / (max(1, m['pods']) * mem_limit)
+        # 2. Memory Score
+        mem_limit = conf.get('mem_limit_bytes', 500000000)
+        score_mem = m['mem'] / (active_capacity_count * mem_limit)
         
-        # 3. Latency Score (New)
+        # 3. Latency Score
         lat_target = conf.get('latency_target_seconds', 0.5)
         score_lat = m['latency'] / lat_target if lat_target > 0 else 0
         
-        # 4. Predictive Score (Dynamic)
+        # 4. Predictive Score
         predictive_util = 0
         if svc in self.models and current_users > 0:
             try:
-                # Predict 60 seconds ahead
                 future_time = elapsed + 60
                 input_df = pd.DataFrame(
                     [[current_users, future_time]], 
                     columns=['scenario_users', 'elapsed_total_seconds']
                 )
                 predicted_cpu = self.models[svc].predict(input_df)[0]
-                # Normalize predicted CPU against total capacity
+                # Predict against *Ordered* capacity (assuming they will be ready)
                 total_capacity = m['pods'] * cpu_limit
                 predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
-            except Exception as e:
-                pass # Silently fail prediction
+            except Exception:
+                pass 
         
-        # CAPA+ Logic: The "Max" Strategy (Scale on worst bottleneck)
-        final_score = max(score_cpu, score_mem, score_lat, predictive_util)
-        
-        # Optional: Print debug info for verification
-        # print(f"[{svc}] Scores - CPU:{score_cpu:.2f} Mem:{score_mem:.2f} Lat:{score_lat:.2f} Pred:{predictive_util:.2f}")
+        # Priority 1 Fix: Weighted Average Strategy
+        # 0.5 CPU + 0.2 Mem + 0.2 Latency + 0.1 Prediction
+        final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
 
         # --- PLAN ---
         if svc not in self.last_scale_time:
@@ -278,7 +280,6 @@ class CAPAPlusController(threading.Thread):
         
         # Scale UP (Aggressive)
         if final_score > conf['scale_up_threshold']:
-            # Anti-oscillation: don't scale up immediately after scaling down
             if self.last_scale_action[svc] == 'down' and (current_time - self.last_scale_time[svc]) < 60:
                 print(f"[{svc}] Scale UP suppressed (recent scale-down)")
                 return
@@ -290,13 +291,10 @@ class CAPAPlusController(threading.Thread):
             self.last_scale_time[svc] = current_time
             self.last_scale_action[svc] = 'up'
             
-        # Scale DOWN (Conservative with longer stabilization)
+        # Scale DOWN (Conservative)
         elif final_score < conf['scale_down_threshold']:
-            # Require 5 minutes of low utilization
             stabilization_window = 300
-            
             if self.last_scale_action[svc] == 'up':
-                # Just scaled up, wait longer
                 stabilization_window = 600
             
             if current_time - self.last_scale_time[svc] > stabilization_window:
@@ -306,23 +304,18 @@ class CAPAPlusController(threading.Thread):
                 self.last_scale_time[svc] = current_time
                 self.last_scale_action[svc] = 'down'
             else:
-                # time_left = stabilization_window - (current_time - self.last_scale_time[svc])
-                # print(f"[{svc}] Scale DOWN suppressed (stabilizing...)")
                 pass
 
         # --- EXECUTE ---
         if action != 'none':
-            # Enforce bounds
             target = max(conf['min'], min(target, conf['max']))
             
             if target != m['pods']:
-                # --- Cost Awareness Logic ---
+                # Cost Awareness Logic
                 node_tier = "Burstable (Cheap)"
                 if target > 10:
                     node_tier = "On-Demand (Expensive)"
                 print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
-                # ----------------------------
-
                 scale_deployment(svc, target)
         
     def stop(self):
@@ -330,12 +323,11 @@ class CAPAPlusController(threading.Thread):
         print("\n>>> CAPA+ Controller Stopped <<<")
 
 # ============================================================
-# LOAD TEST RUNNER (Generates Compatible CSV)
+# LOAD TEST RUNNER
 # ============================================================
 def run_experiment_phase(config_name):
     print(f"\n=== RUNNING PHASE: {config_name} ===")
     
-    # 1. Setup
     if config_name == "baseline":
         subprocess.run("kubectl apply -f ../scaling/hpa_backup.yaml", shell=True)
         controller = None
@@ -347,7 +339,6 @@ def run_experiment_phase(config_name):
     time.sleep(10)
     requests.get(f"{LOCUST_URL}/stats/reset")
     
-    # 2. Run Load Pattern
     rows = []
     start_time = time.time()
     
@@ -360,7 +351,7 @@ def run_experiment_phase(config_name):
             while time.time() < end_step:
                 now = time.time()
                 
-                # --- COLLECT DATA FOR CSV ---
+                # --- COLLECT DATA ---
                 row = {
                     "timestamp": datetime.now().isoformat(),
                     "config": config_name,
@@ -368,61 +359,56 @@ def run_experiment_phase(config_name):
                     "scenario_users": users,
                 }
                 
-                # Locust Data
+                # Locust Data (Robust Fix applied here too)
                 try:
                     stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
                     
-                    # FIX: Extract 'avg_response_time' from the 'Total' entry in the stats list
-                    total_entry = next((s for s in stats.get('stats', []) if s['name'] == 'Total'), None)
-                    row["avg_response_time_ms"] = total_entry.get('avg_response_time', 0) if total_entry else 0
+                    # CORRECTED: Loop to safely find Total avg_response_time
+                    stats_list = stats.get('stats', [])
+                    avg_resp = 0
+                    for entry in stats_list:
+                        if entry.get('name') == 'Total':
+                            avg_resp = entry.get('avg_response_time', 0)
+                            break
+                    row["avg_response_time_ms"] = avg_resp
                     
                     row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
                 except Exception as e:
                     print(f"Locust stats error: {e}")
 
-                # Service Data (Formatted for generate_unified_comparison.py)
+                # Service Data
                 for svc in SERVICES:
                     m = get_metrics(svc)
                     row[f"{svc}_cpu_millicores"] = m['cpu']
                     row[f"{svc}_memory_bytes"] = m['mem']
                     row[f"{svc}_replicas_ordered"] = m['pods']
-                    row[f"{svc}_replicas_ready"] = m['pods'] 
+                    row[f"{svc}_replicas_ready"] = m['ready_pods'] # Updated to track Ready
                     
-                    # FIX: Use the actual configured limit instead of hardcoded 250
                     limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
-                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (m['pods'] * limit)) * 100 if m['pods'] > 0 else 0
+                    # Calculate utilization based on READY pods for accurate visualization
+                    ready_count = max(1, m['ready_pods'])
+                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100
                 
                 rows.append(row)
-                time.sleep(5) # Sample rate
+                time.sleep(5) 
                 
     finally:
         requests.get(f"{LOCUST_URL}/stop")
         if controller: controller.stop()
 
-    # 3. Save Compatible CSV
     df = pd.DataFrame(rows)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    # Filename MUST match what generate_unified_comparison looks for:
     filename = OUTPUT_DIR / f"{config_name}_complete_{ts}.csv"
     df.to_csv(filename, index=False)
     print(f"   -> Saved: {filename}")
     return filename
 
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
     print("Starting Unified Experiment...")
-    
-    # Run 1: Baseline
     run_experiment_phase("baseline")
-    
     print("\nCooldown 60s...")
     time.sleep(60)
-    
-    # Run 2: Elascale
     run_experiment_phase("elascale")
-    
     print("\nDONE. Now run: python3 generate_unified_comparison.py")
