@@ -195,8 +195,8 @@ def plot_service_cpu_and_pods(baseline_df, elascale_df, service):
     
     # Plot 2: CPU Usage per Container
     ax2 = axes[0, 1]
-    for label, df, color in [("Baseline", baseline_df, 'C0'),
-                              ("Elascale", elascale_df, 'C1')]:
+    for label, df, color in [("BaselineHPA", baseline_df, 'C0'),
+                              ("CAPA+", elascale_df, 'C1')]:
         if df is not None and ordered_col in df.columns and cpu_col in df.columns:
             # Calculate CPU per pod
             cpu_per_pod = df[cpu_col] / df[ordered_col].replace(0, 1)
