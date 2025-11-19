@@ -328,6 +328,7 @@ class CAPAPlusController(threading.Thread):
 def run_experiment_phase(config_name):
     print(f"\n=== RUNNING PHASE: {config_name} ===")
     
+    # 1. Setup
     if config_name == "baseline":
         subprocess.run("kubectl apply -f ../scaling/hpa_backup.yaml", shell=True)
         controller = None
@@ -339,6 +340,7 @@ def run_experiment_phase(config_name):
     time.sleep(10)
     requests.get(f"{LOCUST_URL}/stats/reset")
     
+    # 2. Run Load Pattern
     rows = []
     start_time = time.time()
     
@@ -351,7 +353,7 @@ def run_experiment_phase(config_name):
             while time.time() < end_step:
                 now = time.time()
                 
-                # --- COLLECT DATA ---
+                # --- COLLECT DATA FOR CSV ---
                 row = {
                     "timestamp": datetime.now().isoformat(),
                     "config": config_name,
@@ -359,47 +361,63 @@ def run_experiment_phase(config_name):
                     "scenario_users": users,
                 }
                 
-                # Locust Data (Robust Fix applied here too)
+                # Locust Data (Robust Fix applied here)
                 try:
                     stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
                     
-                    # CORRECTED: Loop to safely find Total avg_response_time
-                    stats_list = stats.get('stats', [])
-                    avg_resp = 0
-                    for entry in stats_list:
-                        if entry.get('name') == 'Total':
-                            avg_resp = entry.get('avg_response_time', 0)
-                            break
-                    row["avg_response_time_ms"] = avg_resp
+                    # FIX: Robust extraction for Avg Response Time
+                    # Try top-level key first (some versions)
+                    avg_resp = stats.get('total_avg_response_time')
+                    
+                    # If not found, try finding "Total" in stats list
+                    if avg_resp is None:
+                        stats_list = stats.get('stats', [])
+                        if isinstance(stats_list, list):
+                            for entry in stats_list:
+                                if isinstance(entry, dict) and entry.get('name') == 'Total':
+                                    avg_resp = entry.get('avg_response_time', 0)
+                                    break
+                    
+                    # Default to 0 if still not found
+                    row["avg_response_time_ms"] = avg_resp if avg_resp is not None else 0
                     
                     row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
                 except Exception as e:
                     print(f"Locust stats error: {e}")
+                    # Provide defaults to prevent crash
+                    row["throughput_rps"] = 0
+                    row["fault_rate_percent"] = 0
+                    row["avg_response_time_ms"] = 0
+                    row["p95_response_time_ms"] = 0
 
-                # Service Data
+                # Service Data (Formatted for generate_unified_comparison.py)
                 for svc in SERVICES:
                     m = get_metrics(svc)
                     row[f"{svc}_cpu_millicores"] = m['cpu']
                     row[f"{svc}_memory_bytes"] = m['mem']
                     row[f"{svc}_replicas_ordered"] = m['pods']
-                    row[f"{svc}_replicas_ready"] = m['ready_pods'] # Updated to track Ready
+                    row[f"{svc}_replicas_ready"] = m['ready_pods'] 
                     
+                    # FIX: Use the actual configured limit instead of hardcoded 250
                     limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
+                    
                     # Calculate utilization based on READY pods for accurate visualization
                     ready_count = max(1, m['ready_pods'])
-                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100
+                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100 if m['pods'] > 0 else 0
                 
                 rows.append(row)
-                time.sleep(5) 
+                time.sleep(5) # Sample rate
                 
     finally:
         requests.get(f"{LOCUST_URL}/stop")
         if controller: controller.stop()
 
+    # 3. Save Compatible CSV
     df = pd.DataFrame(rows)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Filename MUST match what generate_unified_comparison looks for:
     filename = OUTPUT_DIR / f"{config_name}_complete_{ts}.csv"
     df.to_csv(filename, index=False)
     print(f"   -> Saved: {filename}")
