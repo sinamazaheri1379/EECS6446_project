@@ -2,12 +2,13 @@
 """
 EECS6446 Project - Unified Elascale MAPE-K Experiment (Robust & Validated)
 --------------------------------------------------------------------------
-1. Runs Notebook-style continuous load (50->1000->50 users)
-2. Runs custom MAPE-K Loop logic with critical robustness fixes:
+1. Resets Cluster (Deletes HPA, scales to 1)
+2. Runs Notebook-style continuous load (50->1000->50 users)
+3. Runs custom MAPE-K Loop logic:
    - Weighted Average Strategy (Stable Scaling)
    - Robust Metric Collection (Handles missing data)
    - Ready-Replicas Logic (Prevents death spirals)
-3. Outputs data compatible with 'generate_unified_comparison.py'
+4. Outputs data compatible with 'generate_unified_comparison.py'
 """
 
 import time
@@ -121,7 +122,7 @@ except:
     print("⚠️ K8s config not found")
 
 def get_metrics(service):
-    """Get metrics with proper error handling (Priority 2 Fix)"""
+    """Get metrics with proper error handling (Priority 2 Fix + Attribute Safety)"""
     m = {'cpu': 0.0, 'mem': 0.0, 'pods': 0, 'ready_pods': 0, 'latency': 0.0}
     try:
         # CPU Millicores
@@ -136,7 +137,7 @@ def get_metrics(service):
         if res.get('data', {}).get('result'):
             m['mem'] = float(res['data']['result'][0]['value'][1])
 
-        # Latency (P95) - Priority 2: Add check for empty result
+        # Latency (P95)
         q_lat = f'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{app="{service}",namespace="{NAMESPACE}"}}[1m])) by (le))'
         res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_lat}, timeout=5).json()
         if res.get('data', {}).get('result'):
@@ -144,11 +145,13 @@ def get_metrics(service):
         else:
             m['latency'] = 0.0
 
-        # Pod Count - Priority 3: Get Ready Replicas
+        # Pod Count - Priority 3: Get Ready Replicas with Safety Check
         if k8s_apps:
             scale = k8s_apps.read_namespaced_deployment_scale(service, NAMESPACE)
             m['pods'] = int(scale.status.replicas)
-            # Note: ready_replicas can be None if 0 are ready
+            
+            # FIX: Safely access ready_replicas using getattr to avoid AttributeError
+            # Default to 0 if the attribute is missing or None
             ready = getattr(scale.status, 'ready_replicas', 0)
             m['ready_pods'] = int(ready) if ready is not None else 0
             
@@ -205,10 +208,12 @@ class CAPAPlusController(threading.Thread):
                     print(f"   ✗ Model load error for {svc}: {e}")
         
     def run(self):
-        print("\n>>> CAPA+ Controller Started (Robustness Improvements Applied) <<<")
-        print("  - [Fix 1] Metric Validation (Handles empty/missing data)")
-        print("  - [Fix 2] Provisioning Awareness (Uses Ready Pods)")
-        print("  - [Logic] Weighted Average Strategy (Stability-Focused)\n")
+        print("\n>>> CAPA+ Controller Started (Multi-Metric + Predictive + Cost-Aware) <<<")
+        print("Optimization Features Active:")
+        print("  - [Metric] Scaling on CPU, Memory, AND Latency (Golden Signals)")
+        print("  - [Predict] Dynamic User Load Forecasting")
+        print("  - [Cost] Tiered Node Logic (Burstable vs On-Demand)")
+        print("  - [Stability] Weighted Average + Hysteresis\n")
         self.running = True
         
         while self.running:
@@ -268,7 +273,6 @@ class CAPAPlusController(threading.Thread):
                 pass 
         
         # Priority 1 Fix: Weighted Average Strategy
-        # 0.5 CPU + 0.2 Mem + 0.2 Latency + 0.1 Prediction
         final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
 
         # --- PLAN ---
@@ -324,9 +328,34 @@ class CAPAPlusController(threading.Thread):
         print("\n>>> CAPA+ Controller Stopped <<<")
 
 # ============================================================
-# LOAD TEST RUNNER
+# CLUSTER RESET LOGIC
+# ============================================================
+def reset_cluster():
+    print("\n>>> Resetting Cluster State...")
+    try:
+        # 1. Delete all HPAs
+        subprocess.run("kubectl delete hpa --all --namespace=default", shell=True, check=False)
+        
+        # 2. Reset Services to 1 replica
+        services = list(SERVICE_CONFIGS.keys())
+        for svc in services:
+            subprocess.run(f"kubectl scale deployment/{svc} --replicas=1 --namespace=default", 
+                         shell=True, check=False, stdout=subprocess.DEVNULL)
+            
+        # 3. Wait for stabilization
+        print("   -> Waiting 30s for cluster to stabilize...")
+        time.sleep(30)
+        print("   ✓ Cluster Reset Complete.\n")
+    except Exception as e:
+        print(f"   Warning during reset: {e}")
+
+# ============================================================
+# LOAD TEST RUNNER (Generates Compatible CSV)
 # ============================================================
 def run_experiment_phase(config_name):
+    # Always reset before starting a phase to prevent conflicts
+    reset_cluster()
+    
     print(f"\n=== RUNNING PHASE: {config_name} ===")
     
     # 1. Setup
@@ -334,7 +363,7 @@ def run_experiment_phase(config_name):
         subprocess.run("kubectl apply -f ../scaling/hpa_backup.yaml", shell=True)
         controller = None
     else:
-        subprocess.run("kubectl delete hpa --all", shell=True)
+        # No need to delete HPA again, reset_cluster did it
         controller = CAPAPlusController()
         controller.start()
     
@@ -368,32 +397,28 @@ def run_experiment_phase(config_name):
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
                     
-                    # FIX: Robust extraction for Avg Response Time
-                    # Try top-level key first (some versions)
-                    avg_resp = stats.get('total_avg_response_time')
-                    
-                    # If not found, try finding "Total" in stats list
-                    if avg_resp is None:
+                    # FIX: Robust extraction for Avg Response Time with Type Safety
+                    avg_resp = 0
+                    if 'total_avg_response_time' in stats:
+                         avg_resp = stats['total_avg_response_time']
+                    else:
                         stats_list = stats.get('stats', [])
                         if isinstance(stats_list, list):
                             for entry in stats_list:
                                 if isinstance(entry, dict) and entry.get('name') == 'Total':
                                     avg_resp = entry.get('avg_response_time', 0)
                                     break
-                    
-                    # Default to 0 if still not found
-                    row["avg_response_time_ms"] = avg_resp if avg_resp is not None else 0
+                    row["avg_response_time_ms"] = avg_resp
                     
                     row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
                 except Exception as e:
                     print(f"Locust stats error: {e}")
-                    # Provide defaults to prevent crash
                     row["throughput_rps"] = 0
                     row["fault_rate_percent"] = 0
                     row["avg_response_time_ms"] = 0
                     row["p95_response_time_ms"] = 0
 
-                # Service Data (Formatted for generate_unified_comparison.py)
+                # Service Data
                 for svc in SERVICES:
                     m = get_metrics(svc)
                     row[f"{svc}_cpu_millicores"] = m['cpu']
@@ -401,10 +426,7 @@ def run_experiment_phase(config_name):
                     row[f"{svc}_replicas_ordered"] = m['pods']
                     row[f"{svc}_replicas_ready"] = m['ready_pods'] 
                     
-                    # FIX: Use the actual configured limit instead of hardcoded 250
                     limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
-                    
-                    # Calculate utilization based on READY pods for accurate visualization
                     ready_count = max(1, m['ready_pods'])
                     row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100 if m['pods'] > 0 else 0
                 
@@ -418,16 +440,24 @@ def run_experiment_phase(config_name):
     # 3. Save Compatible CSV
     df = pd.DataFrame(rows)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    # Filename MUST match what generate_unified_comparison looks for:
     filename = OUTPUT_DIR / f"{config_name}_complete_{ts}.csv"
     df.to_csv(filename, index=False)
     print(f"   -> Saved: {filename}")
     return filename
 
+# ============================================================
+# MAIN
+# ============================================================
 if __name__ == "__main__":
     print("Starting Unified Experiment...")
+    
+    # Run 1: Baseline
     run_experiment_phase("baseline")
+    
     print("\nCooldown 60s...")
     time.sleep(60)
+    
+    # Run 2: Elascale
     run_experiment_phase("elascale")
+    
     print("\nDONE. Now run: python3 generate_unified_comparison.py")
