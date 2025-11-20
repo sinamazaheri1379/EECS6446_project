@@ -196,7 +196,16 @@ class CAPAPlusController(threading.Thread):
         self.last_scale_action = {}  # Track last action to prevent oscillation
         self.models = {}
         self.experiment_start_time = time.time()
-        
+        # Load Predictive Models
+        for svc in ['frontend', 'cartservice', 'checkoutservice']:
+            model_path = f"models/{svc}_cpu_predictor.pkl"
+            if os.path.exists(model_path):
+                try:
+                    self.models[svc] = joblib.load(model_path)
+                    print(f"   ✓ Loaded model for {svc}")
+                except Exception as e:
+                    print(f"   ✗ Model load error for {svc}: {e}")
+
     def run(self):
         print("\n>>> CAPA+ Controller Started (Multi-Metric + Predictive + Cost-Aware) <<<")
         print("Optimization Features Active:")
@@ -221,26 +230,52 @@ class CAPAPlusController(threading.Thread):
 
     def _process_service(self, svc, current_time, elapsed, current_users):
         """MAPE-K Loop for a single service"""
+        
+        # --- MONITOR ---
         m = get_metrics(svc)
         if m['pods'] == 0:
-            return
+            return  # Skip if no pods
         
         conf = SERVICE_CONFIGS[svc]
+        
+        # --- ANALYZE (Level 4: Multi-Metric) ---
+        
+        # Priority 3 Fix: Use Ready Pods to avoid death spirals
         active_capacity_count = max(1, m['ready_pods'])
         
-        # Calculate scores
+        # 1. CPU Score
         cpu_limit = conf['cpu_limit_millicores']
         score_cpu = m['cpu'] / (active_capacity_count * cpu_limit)
         
+        # 2. Memory Score
         mem_limit = conf.get('mem_limit_bytes', 500000000)
         score_mem = m['mem'] / (active_capacity_count * mem_limit)
         
+        # 3. Latency Score
         lat_target = conf.get('latency_target_seconds', 0.5)
         score_lat = m['latency'] / lat_target if lat_target > 0 else 0
         
-        # Weighted average
-        final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat)
+        # 4. Predictive Score
+        predictive_util = 0
+        if svc in self.models and current_users > 0:
+            try:
+                future_time = elapsed + 60
+                input_df = pd.DataFrame(
+                    [[current_users, future_time]], 
+                    columns=['scenario_users', 'elapsed_total_seconds']
+                )
+                predicted_cpu = self.models[svc].predict(input_df)[0]
+                # Predict against *Ordered* capacity (assuming they will be ready)
+                total_capacity = m['pods'] * cpu_limit
+                predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
+            except Exception:
+                pass 
+        
+        # Priority 1 Fix: Weighted Average Strategy (Sum = 1.0)
+        # 0.5 CPU + 0.2 Mem + 0.2 Latency + 0.1 Prediction
+        final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
 
+        # --- PLAN ---
         if svc not in self.last_scale_time:
             self.last_scale_time[svc] = 0
             self.last_scale_action[svc] = 'none'
@@ -248,30 +283,45 @@ class CAPAPlusController(threading.Thread):
         target = m['pods']
         action = 'none'
         
-        # Scaling logic
+        # Scale UP (Aggressive)
         if final_score > conf['scale_up_threshold']:
             if self.last_scale_action[svc] == 'down' and (current_time - self.last_scale_time[svc]) < 60:
+                # print(f"[{svc}] Scale UP suppressed (recent scale-down)")
                 return
             
             target += conf['scale_up_increment']
             action = 'up'
-            print(f"[{svc}] Scale UP: {m['pods']} → {target} | Score={final_score:.2f}")
+            reason = f"Score={final_score:.2f} (CPU:{score_cpu:.2f} Lat:{score_lat:.2f})"
+            print(f"[{svc}] Scale UP: {m['pods']} → {target} | {reason}")
             self.last_scale_time[svc] = current_time
             self.last_scale_action[svc] = 'up'
             
+        # Scale DOWN (Conservative)
         elif final_score < conf['scale_down_threshold']:
-            stabilization_window = 300 if self.last_scale_action[svc] != 'up' else 600
+            stabilization_window = 300
+            if self.last_scale_action[svc] == 'up':
+                stabilization_window = 600
             
             if current_time - self.last_scale_time[svc] > stabilization_window:
                 target -= conf['scale_down_increment']
                 action = 'down'
-                print(f"[{svc}] Scale DOWN: {m['pods']} → {target} | Score={final_score:.2f}")
+                print(f"[{svc}] Scale DOWN: {m['pods']} → {target} | Score={final_score:.2f} (Stable)")
                 self.last_scale_time[svc] = current_time
                 self.last_scale_action[svc] = 'down'
+            else:
+                pass
 
+        # --- EXECUTE ---
         if action != 'none':
             target = max(conf['min'], min(target, conf['max']))
+            
             if target != m['pods']:
+                # Cost Awareness Logic
+                node_tier = "Burstable (Cheap)"
+                if target > 10:
+                    node_tier = "On-Demand (Expensive)"
+                print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
+                
                 scale_deployment(svc, target)
         
     def stop(self):
