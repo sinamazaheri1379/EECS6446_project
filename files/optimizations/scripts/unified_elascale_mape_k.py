@@ -554,7 +554,7 @@ class CAPAPlusController(threading.Thread):
                     break
                 time.sleep(1)
 
-   def _calculate_reward(self, svc, prev_m, curr_m, prev_scores, curr_scores, action_taken):
+    def _calculate_reward(self, svc, prev_m, curr_m, prev_scores, curr_scores, action_taken):
         """
         Reward design (higher is better):
 
