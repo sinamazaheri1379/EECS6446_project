@@ -41,12 +41,12 @@ SERVICE_CONFIGS = {
 }
 
 SERVICES = list(SERVICE_CONFIGS.keys())
-# LOAD_STEPS = [(50, 60), (100, 60), (500, 60), (1000, 180), (500, 60), (100, 60), (50, 60)]
-LOAD_STEPS = [
-    (50, 60),       # Warm-up: 1 min to initialize pods/caches
-    (1000, 1800),   # STEADY STATE: 1000 users for 30 minutes (1800s)
-    (50, 60)        # Cool-down: 1 min to verify scale-down
-]
+LOAD_STEPS = [(50, 60), (100, 60), (500, 60), (1000, 180), (500, 60), (100, 60), (50, 60)]
+# LOAD_STEPS = [
+#    (50, 60),       # Warm-up: 1 min to initialize pods/caches
+#    (1000, 1800),   # STEADY STATE: 1000 users for 30 minutes (1800s)
+#    (50, 60)        # Cool-down: 1 min to verify scale-down
+# ]
 
 try:
     config.load_kube_config()
@@ -77,10 +77,9 @@ def get_metrics(service):
         
         # Pod Count
         if k8s_apps:
-            scale = k8s_apps.read_namespaced_deployment_scale(service, NAMESPACE)
-            m['pods'] = int(scale.status.replicas)
-            ready = getattr(scale.status, 'ready_replicas', 0)
-            m['ready_pods'] = int(ready) if ready is not None else 0
+            deploy = k8s_apps.read_namespaced_deployment(service, NAMESPACE)
+            m['pods'] = deploy.status.replicas or 0
+            m['ready_pods'] = deploy.status.ready_replicas or 0
             
     except Exception as e:
         print(f"Metrics error for {service}: {e}")
