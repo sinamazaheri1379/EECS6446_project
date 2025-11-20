@@ -997,20 +997,18 @@ def run_experiment_phase(config_name):
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
 
                     avg_resp = 0
-                    if 'total_avg_response_time' in stats:
-                        avg_resp = stats['total_avg_response_time']
+                    # 1) Use the correct top-level key
+                    if 'total_average_response_time' in stats:
+                       avg_resp = stats['total_average_response_time']
                     else:
-                        stats_list = stats.get('stats', [])
-                        if isinstance(stats_list, list):
-                            for entry in stats_list:
-                                if (
-                                    isinstance(entry, dict) and
-                                    entry.get('name') == 'Total'
-                                ):
-                                    avg_resp = entry.get(
-                                        'avg_response_time', 0
-                                    )
-                                    break
+                       # 2) Fallback to the "Aggregated" row
+                       stats_list = stats.get('stats', [])
+                       if isinstance(stats_list, list):
+                          for entry in stats_list:
+                              if isinstance(entry, dict) and entry.get('name') in ('Aggregated', 'Total'):
+                                  avg_resp = entry.get('avg_response_time', 0)
+                                  break
+   
                     row["avg_response_time_ms"] = avg_resp
                     row["p95_response_time_ms"] = stats.get(
                         'current_response_time_percentile_95', 0
