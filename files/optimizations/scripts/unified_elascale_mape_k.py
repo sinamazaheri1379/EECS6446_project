@@ -106,38 +106,52 @@ def get_current_user_load():
         return 0
 
 
+# Add this class BEFORE CAPAPlusController
 class QLearningAgent:
-    """
-    A simple Q-Learning Agent for Adaptive Autoscaling.
-    State: (CPU_Load_Bucket, Latency_Bucket)
-    Actions: 0=Scale Down, 1=No Op, 2=Scale Up
-    """
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=0.1):
+    def __init__(self, actions=[0, 1, 2], alpha=0.1, gamma=0.9, epsilon=0.2):
         self.q_table = {} 
+        self.actions = actions # 0:Down, 1:Stay, 2:Up
         self.alpha = alpha     # Learning Rate
         self.gamma = gamma     # Discount Factor
-        self.epsilon = epsilon # Exploration Rate (10% random actions)
+        self.epsilon = epsilon # Start with more exploration (20%)
+        self.epsilon_decay = 0.995  # Decay exploration over time
+        self.epsilon_min = 0.01     # Minimum exploration rate
 
-    def get_state(self, cpu_util, latency_score):
-        # Discretize continuous metrics into "buckets" to make the Q-table small
-        # 0=Low, 1=Target, 2=High
-        cpu_state = 0 if cpu_util < 0.4 else (2 if cpu_util > 0.8 else 1)
+    def get_state(self, cpu_util, latency_score, pod_ratio):
+        """
+        Enhanced state discretization with pod count awareness
+        """
+        # CPU: 0=Low(<40%), 1=Target(40-70%), 2=High(>70%)
+        cpu_state = 0 if cpu_util < 0.4 else (2 if cpu_util > 0.7 else 1)
+        
+        # Latency: 0=Good(<0.8x), 1=OK(0.8-1.2x), 2=Bad(>1.2x)
         lat_state = 0 if latency_score < 0.8 else (2 if latency_score > 1.2 else 1)
-        return (cpu_state, lat_state)
+        
+        # Pods: 0=Low(<0.3 of max), 1=Medium(0.3-0.7), 2=High(>0.7)
+        pod_state = 0 if pod_ratio < 0.3 else (2 if pod_ratio > 0.7 else 1)
+        
+        return (cpu_state, lat_state, pod_state)
 
     def choose_action(self, state):
         if state not in self.q_table:
-            self.q_table[state] = [0.0, 0.0, 0.0] # Initialize Q-values
+            # Initialize with slight bias toward "no change"
+            self.q_table[state] = [-0.1, 0.0, -0.1]  # [down, stay, up]
         
-        # Epsilon-Greedy: Explore vs Exploit
+        # Epsilon-Greedy with decay
         if np.random.uniform(0, 1) < self.epsilon:
-            return np.random.choice([0, 1, 2]) # Explore (Random)
+            return np.random.choice([0, 1, 2])  # Explore
         else:
-            return np.argmax(self.q_table[state]) # Exploit (Best known action)
+            return np.argmax(self.q_table[state])  # Exploit
+    
+    def decay_epsilon(self):
+        """Reduce exploration over time"""
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def learn(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = [-0.1, 0.0, -0.1]
         if next_state not in self.q_table:
-            self.q_table[next_state] = [0.0, 0.0, 0.0]
+            self.q_table[next_state] = [-0.1, 0.0, -0.1]
             
         old_q = self.q_table[state][action]
         next_max = np.max(self.q_table[next_state])
@@ -145,9 +159,7 @@ class QLearningAgent:
         # Bellman Equation Update
         new_q = (1 - self.alpha) * old_q + self.alpha * (reward + self.gamma * next_max)
         self.q_table[state][action] = new_q
-# ============================================================
-# MAPE-K CONTROLLER THREAD
-# ============================================================
+
 class CAPAPlusController(threading.Thread):
     def __init__(self):
         super().__init__()
@@ -157,59 +169,89 @@ class CAPAPlusController(threading.Thread):
         self.models = {}
         self.experiment_start_time = time.time()
         
+        # FIX 1: Create agents ONCE in __init__ for each service
+        self.rl_agents = {svc: QLearningAgent() for svc in SERVICES}
+        self.last_rl_state = {}
+        self.last_rl_action = {}
+        self.rl_metrics = {svc: [] for svc in SERVICES}  # Track performance
+        
+        # Load predictive models with Safety Check
         for svc in ['frontend', 'cartservice', 'checkoutservice']:
             model_path = f"models/{svc}_cpu_predictor.pkl"
             if os.path.exists(model_path):
-                self.models[svc] = joblib.load(model_path)
-        
-    def run(self):
-        print("\n>>> CAPA+ Controller Started <<<")
-        self.running = True
-        
-        while self.running:
-            current_time = time.time()
-            elapsed = current_time - self.experiment_start_time
-            current_users = get_current_user_load()
-            
-            for svc in SERVICES:
                 try:
-                    self._process_service(svc, current_time, elapsed, current_users)
+                    self.models[svc] = joblib.load(model_path)
+                    print(f"   ✓ Loaded model for {svc}")
                 except Exception as e:
-                    print(f"Error processing {svc}: {e}")
-            
-            # Fix 4: Check running flag more frequently for faster shutdown
-            for _ in range(15): 
-                if not self.running: break
-                time.sleep(1)
+                    print(f"   ✗ Model load error for {svc}: {e}")
+
+    def _calculate_reward(self, svc, m, score_cpu, score_lat, action_taken):
+        """
+        Sophisticated reward function considering multiple objectives
+        """
+        conf = SERVICE_CONFIGS[svc]
+        
+        # 1. Efficiency Reward (minimize resource usage)
+        pod_ratio = m['pods'] / conf['max']
+        efficiency_reward = 1.0 - pod_ratio  # Higher reward for fewer pods
+        
+        # 2. Performance Penalty (SLA violations)
+        sla_penalty = 0
+        if score_lat > 1.0:  # Latency exceeds target
+            sla_penalty = -2.0 * (score_lat - 1.0)  # Proportional penalty
+        
+        # 3. Stability Reward (penalize frequent changes)
+        stability_reward = 0
+        if action_taken == 1:  # No change
+            stability_reward = 0.2
+        
+        # 4. Ready Pod Penalty (penalize if pods aren't ready)
+        readiness_penalty = 0
+        if m['pods'] > 0 and m['ready_pods'] < m['pods']:
+            readiness_penalty = -0.5 * (1 - m['ready_pods'] / m['pods'])
+        
+        # 5. CPU Utilization Reward (sweet spot between 40-70%)
+        cpu_reward = 0
+        if 0.4 <= score_cpu <= 0.7:
+            cpu_reward = 0.5
+        elif score_cpu < 0.2:  # Under-utilized
+            cpu_reward = -0.3
+        elif score_cpu > 0.9:  # Over-utilized
+            cpu_reward = -0.5
+        
+        # Composite reward
+        total_reward = (
+            0.3 * efficiency_reward +
+            0.3 * sla_penalty +
+            0.2 * cpu_reward +
+            0.1 * stability_reward +
+            0.1 * readiness_penalty
+        )
+        
+        return total_reward
 
     def _process_service(self, svc, current_time, elapsed, current_users):
-        """MAPE-K Loop for a single service (Optimized Level 4 + Shadow RL)"""
+        """Enhanced MAPE-K Loop with corrected Q-Learning"""
         
         # --- MONITOR ---
         m = get_metrics(svc)
         if m['pods'] == 0:
-            return  # Skip if no pods
+            return
         
         conf = SERVICE_CONFIGS[svc]
-        
-        # --- ANALYZE (Level 4: Multi-Metric) ---
-        
-        # Safety: Use Ready Pods to avoid 'death spirals' (Priority 3 Fix)
         active_capacity_count = max(1, m['ready_pods'])
         
-        # 1. CPU Score (Primary Signal)
+        # --- ANALYZE ---
         cpu_limit = conf['cpu_limit_millicores']
         score_cpu = m['cpu'] / (active_capacity_count * cpu_limit)
         
-        # 2. Memory Score (Secondary Signal)
         mem_limit = conf.get('mem_limit_bytes', 500000000)
         score_mem = m['mem'] / (active_capacity_count * mem_limit)
         
-        # 3. Latency Score (Quality of Service)
         lat_target = conf.get('latency_target_seconds', 0.5)
         score_lat = m['latency'] / lat_target if lat_target > 0 else 0
         
-        # 4. Predictive Score (Forward-Looking)
+        # Predictive score (unchanged)
         predictive_util = 0
         if svc in self.models and current_users > 0:
             try:
@@ -219,50 +261,55 @@ class CAPAPlusController(threading.Thread):
                     columns=['scenario_users', 'elapsed_total_seconds']
                 )
                 predicted_cpu = self.models[svc].predict(input_df)[0]
-                # Predict against *Ordered* capacity (assuming they will be ready)
                 total_capacity = m['pods'] * cpu_limit
                 predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
             except Exception:
-                pass 
-
-        # --- SHADOW MODE: REINFORCEMENT LEARNING (Level 5) ---
-        # This runs the RL logic but does NOT execute the action.
-        # It logs the learning process for your report.
+                pass
         
-        if not hasattr(self, 'agent'):
-            self.agent = QLearningAgent() # Ensure QLearningAgent class is defined above
-            self.last_rl_state = {}
-            self.last_rl_action = {}
-
-        # RL Step 1: Define Current State
-        current_state = self.agent.get_state(score_cpu, score_lat)
+        # --- Q-LEARNING (Shadow Mode) ---
+        agent = self.rl_agents[svc]
+        pod_ratio = m['pods'] / conf['max']
         
-        # RL Step 2: Calculate Reward for LAST action (if valid)
+        # Get current state
+        current_state = agent.get_state(score_cpu, score_lat, pod_ratio)
+        
+        # Calculate reward for previous action (if exists)
         if svc in self.last_rl_state and svc in self.last_rl_action:
-            # Reward = Efficiency (1/Pods) - Penalty (if Latency > Target)
-            efficiency = 1.0 / max(1, m['pods'])
-            penalty = 5.0 if score_lat > 1.0 else 0.0
-            reward = efficiency - penalty
+            # Map RL action to actual scaling action for reward calc
+            # 0=Scale Down, 1=No Op, 2=Scale Up
+            reward = self._calculate_reward(svc, m, score_cpu, score_lat, self.last_rl_action[svc])
             
-            # RL Step 3: Learn
-            self.agent.learn(self.last_rl_state[svc], self.last_rl_action[svc], reward, current_state)
+            # Learn from experience
+            agent.learn(self.last_rl_state[svc], self.last_rl_action[svc], reward, current_state)
             
-        # RL Step 4: Choose Next Action
-        rl_action_idx = self.agent.choose_action(current_state)
+            # Track metrics for analysis
+            self.rl_metrics[svc].append({
+                'timestamp': current_time,
+                'state': self.last_rl_state[svc],
+                'action': self.last_rl_action[svc],
+                'reward': reward,
+                'q_values': agent.q_table.get(self.last_rl_state[svc], [0,0,0]).copy()
+            })
+            
+            # Decay exploration
+            agent.decay_epsilon()
+        
+        # Choose next action (shadow - not executed)
+        rl_action_idx = agent.choose_action(current_state)
         self.last_rl_state[svc] = current_state
         self.last_rl_action[svc] = rl_action_idx
         
-        # RL Logging (Optional - uncomment to see in stdout)
-        # rl_decisions = ["DOWN", "STAY", "UP"]
-        # print(f"   [Shadow-RL] {svc} State:{current_state} Reward:{reward:.2f} Action:{rl_decisions[rl_action_idx]}")
-
-        # --- STRATEGY SELECTION (Actual Execution) ---
+        # Log Q-Learning decision
+        actions = ["SCALE_DOWN", "NO_CHANGE", "SCALE_UP"]
+        if svc in self.last_rl_state:
+            print(f"   [RL-Shadow] {svc}: State{current_state} → {actions[rl_action_idx]} "
+                  f"(ε={agent.epsilon:.3f}, Q={agent.q_table.get(current_state, [0,0,0])})")
         
-        # Strategy: Weighted Average (Stability-Focused)
-        # Weights sum to 1.0
+        # --- ACTUAL EXECUTION (Original MAPE-K Logic) ---
+        # Weighted Average Strategy (Stability-Focused)
         final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
-
-        # Safety Net: If ANY metric is critically high (>95%), switch to Max Strategy
+        
+        # Safety Net (Max Strategy if critical)
         if max(score_cpu, score_mem, score_lat) > 0.95:
             final_score = max(score_cpu, score_mem, score_lat)
 
@@ -276,20 +323,19 @@ class CAPAPlusController(threading.Thread):
         
         # Scale UP (Aggressive)
         if final_score > conf['scale_up_threshold']:
-            # Anti-oscillation: don't scale up immediately after scaling down
+            # Anti-oscillation
             if self.last_scale_action[svc] == 'down' and (current_time - self.last_scale_time[svc]) < 60:
                 return
             
             target += conf['scale_up_increment']
             action = 'up'
-            reason = f"Score={final_score:.2f} (CPU:{score_cpu:.2f} Lat:{score_lat:.2f} Pred:{predictive_util:.2f})"
+            reason = f"Score={final_score:.2f} (CPU:{score_cpu:.2f} Lat:{score_lat:.2f})"
             print(f"[{svc}] Scale UP: {m['pods']} → {target} | {reason}")
             self.last_scale_time[svc] = current_time
             self.last_scale_action[svc] = 'up'
             
         # Scale DOWN (Conservative)
         elif final_score < conf['scale_down_threshold']:
-            # Variable window based on previous action (Hysteresis)
             stabilization_window = 300
             if self.last_scale_action[svc] == 'up':
                 stabilization_window = 600
@@ -314,7 +360,25 @@ class CAPAPlusController(threading.Thread):
                 print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
                 
                 scale_deployment(svc, target)
-        
+            
+    def save_rl_metrics(self):
+        """Save Q-Learning metrics for analysis"""
+        for svc, metrics in self.rl_metrics.items():
+            if metrics:
+                df = pd.DataFrame(metrics)
+                filename = OUTPUT_DIR / f"rl_metrics_{svc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                df.to_csv(filename, index=False)
+                print(f"Saved RL metrics: {filename}")
+                
+                # Also save Q-tables
+                q_table_file = OUTPUT_DIR / f"q_table_{svc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                q_table_serializable = {
+                    str(k): v for k, v in self.rl_agents[svc].q_table.items()
+                }
+                with open(q_table_file, 'w') as f:
+                    json.dump(q_table_serializable, f, indent=2)
+                print(f"Saved Q-table: {q_table_file}")
+
     def stop(self):
         self.running = False
 
