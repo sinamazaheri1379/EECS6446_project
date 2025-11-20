@@ -132,16 +132,23 @@ def update_global_latency_from_locust():
         if not stats_list:
             return
 
-        # Usually the first entry is "Total"
+        # First entry usually "Total"
         p95_ms = stats_list[0].get("current_response_time_percentile_95", 0.0)
+
+        # Convert NEW value BEFORE printing
+        new_latency_sec = float(p95_ms) / 1000.0
+
+        # Debug print with NEW value
         if p95_ms > 0:
-             print(f"[Latency] p95={p95_ms:.1f} ms ({GLOBAL_P95_LATENCY:.3f} s)")
-        # Locust gives ms → convert to seconds for RL controller
-        GLOBAL_P95_LATENCY = float(p95_ms) / 1000.0
+            print(f"[Latency] p95={p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
+
+        # Update global shared latency
+        GLOBAL_P95_LATENCY = new_latency_sec
 
     except Exception as e:
         print(f"[Latency] Failed to fetch from Locust: {e}")
-        # Keep last good value; do not reset to 0 so RL doesn't think latency is perfect.
+        # Keep last good latency value
+
 
 def get_metrics(service):
     """Get metrics with proper error handling."""
