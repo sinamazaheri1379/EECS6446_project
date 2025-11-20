@@ -227,85 +227,170 @@ def reset_cluster():
 # LOAD TEST RUNNER
 # ============================================================
 def run_experiment_phase(config_name):
+    # Always reset before starting a phase to prevent conflicts
     reset_cluster()
     print(f"\n=== RUNNING PHASE: {config_name} ===")
     
+    # -----------------------------------
+    # Phase setup: HPA vs CAPA+ controller
+    # -----------------------------------
+    controller = None
     if config_name == "baseline":
         subprocess.run("kubectl apply -f ../scaling/hpa_backup.yaml", shell=True)
-        controller = None
     else:
         controller = CAPAPlusController()
         controller.start()
     
+    # Give cluster + Locust a moment to settle
     time.sleep(10)
-    requests.get(f"{LOCUST_URL}/stats/reset")
-    
+
+    # Try to reset Locust stats (non-fatal if it fails)
+    try:
+        requests.get(f"{LOCUST_URL}/stats/reset", timeout=3)
+    except Exception as e:
+        print(f"⚠️ Could not reset Locust stats: {e}")
+
     rows = []
     start_time = time.time()
     
     try:
         for users, duration in LOAD_STEPS:
             print(f"   -> Step: {users} users for {duration}s")
-            requests.post(f"{LOCUST_URL}/swarm", data={"user_count": users, "spawn_rate": 20})
+            
+            # Start / update Locust swarm for this step
+            try:
+                requests.post(
+                    f"{LOCUST_URL}/swarm",
+                    data={"user_count": users, "spawn_rate": 20},
+                    timeout=3,
+                )
+            except Exception as e:
+                print(f"⚠️ Locust swarm error (users={users}): {e}")
+            
             end_step = time.time() + duration
+
             while time.time() < end_step:
                 now = time.time()
-                # ... (Data collection logic remains the same safe version) ...
+                
+                # Base row fields
                 row = {
                     "timestamp": datetime.now().isoformat(),
                     "config": config_name,
                     "elapsed_total_seconds": now - start_time,
                     "scenario_users": users,
                 }
-                # Locust Data
+
+                # -----------------------------------
+                # Locust metrics (throughput, faults, RT)
+                # -----------------------------------
                 try:
-                    stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
-                    row["throughput_rps"] = stats.get('total_rps', 0)
-                    row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
+                    stats = requests.get(
+                        f"{LOCUST_URL}/stats/requests",
+                        timeout=3
+                    ).json()
                     
+                    # Throughput and fault rate
+                    row["throughput_rps"] = stats.get("total_rps", 0)
+                    row["fault_rate_percent"] = stats.get("fail_ratio", 0) * 100
+
+                    # Average response time (robust fallback)
                     avg_resp = 0
-                    if 'total_avg_response_time' in stats:
-                         avg_resp = stats['total_avg_response_time']
+
+                    # Preferred: top-level "total_avg_response_time"
+                    if "total_avg_response_time" in stats:
+                        avg_resp = stats["total_avg_response_time"]
                     else:
-                        stats_list = stats.get('stats', [])
-                        if isinstance(stats_list, list):
+                        stats_list = stats.get("stats", [])
+                        if isinstance(stats_list, list) and stats_list:
+                            # Look for an aggregate / total entry
+                            found = False
                             for entry in stats_list:
-                                if isinstance(entry, dict) and entry.get('name') == 'Total':
-                                    avg_resp = entry.get('avg_response_time', 0)
+                                if not isinstance(entry, dict):
+                                    continue
+                                name = entry.get("name", "")
+                                # Common patterns: "Total", "", or contains "total"
+                                if (
+                                    name == "Total"
+                                    or name == ""
+                                    or "total" in name.lower()
+                                ):
+                                    avg_resp = entry.get("avg_response_time", 0)
+                                    found = True
                                     break
+                            # Final fallback: last entry if nothing matched
+                            if not found:
+                                last = stats_list[-1]
+                                if isinstance(last, dict):
+                                    avg_resp = last.get("avg_response_time", 0)
+
                     row["avg_response_time_ms"] = avg_resp
-                    row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
+                    row["p95_response_time_ms"] = stats.get(
+                        "current_response_time_percentile_95", 0
+                    )
+
                 except Exception as e:
+                    print(f"⚠️ Locust stats error: {e}")
                     row["throughput_rps"] = 0
                     row["fault_rate_percent"] = 0
                     row["avg_response_time_ms"] = 0
                     row["p95_response_time_ms"] = 0
 
+                # -----------------------------------
+                # Service metrics from Prometheus + K8s
+                # -----------------------------------
                 for svc in SERVICES:
                     m = get_metrics(svc)
-                    row[f"{svc}_cpu_millicores"] = m['cpu']
-                    row[f"{svc}_memory_bytes"] = m['mem']
-                    row[f"{svc}_replicas_ordered"] = m['pods']
-                    row[f"{svc}_replicas_ready"] = m['ready_pods'] 
-                    limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
-                    ready_count = max(1, m['ready_pods'])
-                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100 if m['pods'] > 0 else 0
-                
+                    row[f"{svc}_cpu_millicores"] = m["cpu"]
+                    row[f"{svc}_memory_bytes"] = m["mem"]
+                    row[f"{svc}_replicas_ordered"] = m["pods"]
+                    row[f"{svc}_replicas_ready"] = m["ready_pods"]
+
+                    limit = SERVICE_CONFIGS[svc]["cpu_limit_millicores"]
+
+                    # Option A (more semantic): 0% if no ready pods
+                    if m["pods"] > 0 and m["ready_pods"] > 0:
+                        row[f"{svc}_cpu_percent"] = (
+                            m["cpu"] / (m["ready_pods"] * limit)
+                        ) * 100
+                    else:
+                        row[f"{svc}_cpu_percent"] = 0
+
+                    # If you prefer your original behavior, replace the block above with:
+                    # ready_count = max(1, m["ready_pods"])
+                    # row[f"{svc}_cpu_percent"] = (
+                    #     (m["cpu"] / (ready_count * limit)) * 100 if m["pods"] > 0 else 0
+                    # )
+
                 rows.append(row)
                 time.sleep(5)
-                
+
     finally:
-        requests.get(f"{LOCUST_URL}/stop")
+        # Stop Locust gracefully
+        try:
+            requests.get(f"{LOCUST_URL}/stop", timeout=3)
+        except Exception as e:
+            print(f"⚠️ Locust stop error: {e}")
+        
+        # Stop controller thread if running
         if controller:
             controller.stop()
-            controller.join() # Fix 4: Wait for thread to finish
+            # Wait for thread to finish (avoids zombie threads between phases)
+            try:
+                controller.join()
+            except RuntimeError:
+                # In case thread was never started or already dead
+                pass
 
+    # -----------------------------------
+    # Save collected data
+    # -----------------------------------
     df = pd.DataFrame(rows)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = OUTPUT_DIR / f"{config_name}_complete_{ts}.csv"
     df.to_csv(filename, index=False)
     print(f"   -> Saved: {filename}")
     return filename
+
 
 if __name__ == "__main__":
     print("Starting Unified Experiment...")
