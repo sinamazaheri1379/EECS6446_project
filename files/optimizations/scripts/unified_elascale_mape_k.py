@@ -106,6 +106,46 @@ def get_current_user_load():
     except:
         return 0
 
+
+class QLearningAgent:
+    """
+    A simple Q-Learning Agent for Adaptive Autoscaling.
+    State: (CPU_Load_Bucket, Latency_Bucket)
+    Actions: 0=Scale Down, 1=No Op, 2=Scale Up
+    """
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=0.1):
+        self.q_table = {} 
+        self.alpha = alpha     # Learning Rate
+        self.gamma = gamma     # Discount Factor
+        self.epsilon = epsilon # Exploration Rate (10% random actions)
+
+    def get_state(self, cpu_util, latency_score):
+        # Discretize continuous metrics into "buckets" to make the Q-table small
+        # 0=Low, 1=Target, 2=High
+        cpu_state = 0 if cpu_util < 0.4 else (2 if cpu_util > 0.8 else 1)
+        lat_state = 0 if latency_score < 0.8 else (2 if latency_score > 1.2 else 1)
+        return (cpu_state, lat_state)
+
+    def choose_action(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = [0.0, 0.0, 0.0] # Initialize Q-values
+        
+        # Epsilon-Greedy: Explore vs Exploit
+        if np.random.uniform(0, 1) < self.epsilon:
+            return np.random.choice([0, 1, 2]) # Explore (Random)
+        else:
+            return np.argmax(self.q_table[state]) # Exploit (Best known action)
+
+    def learn(self, state, action, reward, next_state):
+        if next_state not in self.q_table:
+            self.q_table[next_state] = [0.0, 0.0, 0.0]
+            
+        old_q = self.q_table[state][action]
+        next_max = np.max(self.q_table[next_state])
+        
+        # Bellman Equation Update
+        new_q = (1 - self.alpha) * old_q + self.alpha * (reward + self.gamma * next_max)
+        self.q_table[state][action] = new_q
 # ============================================================
 # MAPE-K CONTROLLER THREAD
 # ============================================================
@@ -144,37 +184,90 @@ class CAPAPlusController(threading.Thread):
                 time.sleep(1)
 
     def _process_service(self, svc, current_time, elapsed, current_users):
+        """MAPE-K Loop for a single service (Optimized Level 4 + Shadow RL)"""
+        
+        # --- MONITOR ---
         m = get_metrics(svc)
-        if m['pods'] == 0: return
+        if m['pods'] == 0:
+            return  # Skip if no pods
         
         conf = SERVICE_CONFIGS[svc]
+        
+        # --- ANALYZE (Level 4: Multi-Metric) ---
+        
+        # Safety: Use Ready Pods to avoid 'death spirals' (Priority 3 Fix)
         active_capacity_count = max(1, m['ready_pods'])
         
+        # 1. CPU Score (Primary Signal)
         cpu_limit = conf['cpu_limit_millicores']
         score_cpu = m['cpu'] / (active_capacity_count * cpu_limit)
         
+        # 2. Memory Score (Secondary Signal)
         mem_limit = conf.get('mem_limit_bytes', 500000000)
         score_mem = m['mem'] / (active_capacity_count * mem_limit)
         
+        # 3. Latency Score (Quality of Service)
         lat_target = conf.get('latency_target_seconds', 0.5)
         score_lat = m['latency'] / lat_target if lat_target > 0 else 0
         
+        # 4. Predictive Score (Forward-Looking)
         predictive_util = 0
         if svc in self.models and current_users > 0:
             try:
-                input_df = pd.DataFrame([[current_users, elapsed + 60]], columns=['scenario_users', 'elapsed_total_seconds'])
+                future_time = elapsed + 60
+                input_df = pd.DataFrame(
+                    [[current_users, future_time]], 
+                    columns=['scenario_users', 'elapsed_total_seconds']
+                )
                 predicted_cpu = self.models[svc].predict(input_df)[0]
-                
-                # Fix 5: Safety check for division
+                # Predict against *Ordered* capacity (assuming they will be ready)
                 total_capacity = m['pods'] * cpu_limit
                 predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
             except Exception:
                 pass 
+
+        # --- SHADOW MODE: REINFORCEMENT LEARNING (Level 5) ---
+        # This runs the RL logic but does NOT execute the action.
+        # It logs the learning process for your report.
         
+        if not hasattr(self, 'agent'):
+            self.agent = QLearningAgent() # Ensure QLearningAgent class is defined above
+            self.last_rl_state = {}
+            self.last_rl_action = {}
+
+        # RL Step 1: Define Current State
+        current_state = self.agent.get_state(score_cpu, score_lat)
+        
+        # RL Step 2: Calculate Reward for LAST action (if valid)
+        if svc in self.last_rl_state and svc in self.last_rl_action:
+            # Reward = Efficiency (1/Pods) - Penalty (if Latency > Target)
+            efficiency = 1.0 / max(1, m['pods'])
+            penalty = 5.0 if score_lat > 1.0 else 0.0
+            reward = efficiency - penalty
+            
+            # RL Step 3: Learn
+            self.agent.learn(self.last_rl_state[svc], self.last_rl_action[svc], reward, current_state)
+            
+        # RL Step 4: Choose Next Action
+        rl_action_idx = self.agent.choose_action(current_state)
+        self.last_rl_state[svc] = current_state
+        self.last_rl_action[svc] = rl_action_idx
+        
+        # RL Logging (Optional - uncomment to see in stdout)
+        # rl_decisions = ["DOWN", "STAY", "UP"]
+        # print(f"   [Shadow-RL] {svc} State:{current_state} Reward:{reward:.2f} Action:{rl_decisions[rl_action_idx]}")
+
+        # --- STRATEGY SELECTION (Actual Execution) ---
+        
+        # Strategy: Weighted Average (Stability-Focused)
+        # Weights sum to 1.0
         final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
+
+        # Safety Net: If ANY metric is critically high (>95%), switch to Max Strategy
         if max(score_cpu, score_mem, score_lat) > 0.95:
             final_score = max(score_cpu, score_mem, score_lat)
 
+        # --- PLAN ---
         if svc not in self.last_scale_time:
             self.last_scale_time[svc] = 0
             self.last_scale_action[svc] = 'none'
@@ -182,27 +275,45 @@ class CAPAPlusController(threading.Thread):
         target = m['pods']
         action = 'none'
         
+        # Scale UP (Aggressive)
         if final_score > conf['scale_up_threshold']:
+            # Anti-oscillation: don't scale up immediately after scaling down
             if self.last_scale_action[svc] == 'down' and (current_time - self.last_scale_time[svc]) < 60:
                 return
+            
             target += conf['scale_up_increment']
             action = 'up'
+            reason = f"Score={final_score:.2f} (CPU:{score_cpu:.2f} Lat:{score_lat:.2f} Pred:{predictive_util:.2f})"
+            print(f"[{svc}] Scale UP: {m['pods']} → {target} | {reason}")
             self.last_scale_time[svc] = current_time
             self.last_scale_action[svc] = 'up'
             
+        # Scale DOWN (Conservative)
         elif final_score < conf['scale_down_threshold']:
-            stabilization_window = 300 if self.last_scale_action[svc] != 'up' else 600
+            # Variable window based on previous action (Hysteresis)
+            stabilization_window = 300
+            if self.last_scale_action[svc] == 'up':
+                stabilization_window = 600
+            
             if current_time - self.last_scale_time[svc] > stabilization_window:
                 target -= conf['scale_down_increment']
                 action = 'down'
+                print(f"[{svc}] Scale DOWN: {m['pods']} → {target} | Score={final_score:.2f} (Stable)")
                 self.last_scale_time[svc] = current_time
                 self.last_scale_action[svc] = 'down'
 
+        # --- EXECUTE ---
         if action != 'none':
+            # Enforce bounds
             target = max(conf['min'], min(target, conf['max']))
+            
             if target != m['pods']:
-                node_tier = "On-Demand (Expensive)" if target > 10 else "Burstable (Cheap)"
+                # Cost Awareness Logic
+                node_tier = "Burstable (Cheap)"
+                if target > 10:
+                    node_tier = "On-Demand (Expensive)"
                 print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
+                
                 scale_deployment(svc, target)
         
     def stop(self):
