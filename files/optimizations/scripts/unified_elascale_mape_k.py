@@ -124,20 +124,33 @@ def update_global_latency_from_locust():
         resp = requests.get(f"{LOCUST_URL}/stats/requests", timeout=5)
         data = resp.json()
 
-        p95_ms = data.get("current_response_time_percentile_95", None)
-
-        if p95_ms is None:
-            print("[Latency] p95 missing or null. Locust likely has 0 users running.")
+        # If Locust is not running or no users, don't touch the old value
+        if data.get("state") != "running" or data.get("user_count", 0) == 0:
             return
 
-        new_latency_sec = float(p95_ms) / 1000.0
+        stats_list = data.get("stats", [])
+        if not stats_list:
+            return
 
-        print(f"[Latency] p95={p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
+        # Find the aggregated entry (often last one, name == "Aggregated")
+        agg = next((s for s in stats_list if s.get("name") == "Aggregated"), stats_list[0])
 
-        GLOBAL_P95_LATENCY = new_latency_sec
+        # Locust often doesn’t give 95th directly per entry, so use ninetieth_response_time as proxy or your own logic
+        p95_ms = agg.get("current_response_time_percentile_95")
+        if p95_ms is None:
+            # fallback: approximate p95 with 90th
+            p95_ms = agg.get("ninetieth_response_time", 0.0)
+
+        if p95_ms and p95_ms > 0:
+            new_latency_sec = float(p95_ms) / 1000.0
+            print(f"[Latency] p95≈{p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
+            GLOBAL_P95_LATENCY = new_latency_sec
+        # else: don't overwrite, keep last good value
 
     except Exception as e:
         print(f"[Latency] Failed to fetch from Locust: {e}")
+        # keep last good value
+
 
 
 def get_metrics(service):
