@@ -171,7 +171,7 @@ def plot_service_cpu_and_pods(baseline_df, elascale_df, service):
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     service_title = service.replace('service', ' Service').title()
-    fig.suptitle(f'{service_title} - Baseline vs Elascale', 
+    fig.suptitle(f'{service_title} - BaselineHPA vs CAPA+', 
                  fontsize=14, fontweight='bold')
     
     cpu_col = f"{service}_cpu_millicores"
@@ -212,8 +212,8 @@ def plot_service_cpu_and_pods(baseline_df, elascale_df, service):
     # Plot 3: Pod Count (ordered vs ready)
     ax3 = axes[1, 0]
     for label, df, color_ordered, color_ready in [
-        ("Baseline", baseline_df, 'C0', 'C3'),
-        ("Elascale", elascale_df, 'C1', 'C4')
+        ("BaselineHPA", baseline_df, 'C0', 'C3'),
+        ("CAPA+", elascale_df, 'C1', 'C4')
     ]:
         if df is not None and ordered_col in df.columns:
             ax3.plot(df['elapsed_minutes'], df[ordered_col],
