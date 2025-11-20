@@ -35,8 +35,10 @@ LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
 OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-# Shared latency value for all services (in SECONDS)
-GLOBAL_P95_LATENCY = 0.0
+# Shared latency value for all services (in SECONDS) – warm start at target-ish
+GLOBAL_P95_LATENCY = 0.20        # ~200 ms
+LATENCY_EWMA_ALPHA = 0.2         # smoothing factor
+
 
 
 
@@ -119,12 +121,18 @@ except Exception:
     k8s_apps = None
 
 def update_global_latency_from_locust():
+    """
+    Update GLOBAL_P95_LATENCY using Locust stats with EMA smoothing.
+    - Ignores periods with 0 users.
+    - Uses current p95 if available, else ninetieth_response_time.
+    - Applies exponential moving average to avoid jitter / zeros.
+    """
     global GLOBAL_P95_LATENCY
     try:
         resp = requests.get(f"{LOCUST_URL}/stats/requests", timeout=5)
         data = resp.json()
 
-        # If Locust is not running or no users, don't touch the old value
+        # No active load → keep previous latency estimate
         if data.get("state") != "running" or data.get("user_count", 0) == 0:
             return
 
@@ -132,25 +140,35 @@ def update_global_latency_from_locust():
         if not stats_list:
             return
 
-        # Find the aggregated entry (often last one, name == "Aggregated")
-        agg = next((s for s in stats_list if s.get("name") == "Aggregated"), stats_list[0])
+        # Prefer the aggregated entry (name == "Aggregated"), else fallback
+        agg = next((s for s in stats_list if s.get("name") == "Aggregated"),
+                   stats_list[0])
 
-        # Locust often doesn’t give 95th directly per entry, so use ninetieth_response_time as proxy or your own logic
         p95_ms = agg.get("current_response_time_percentile_95")
         if p95_ms is None:
-            # fallback: approximate p95 with 90th
             p95_ms = agg.get("ninetieth_response_time", 0.0)
 
-        if p95_ms and p95_ms > 0:
-            new_latency_sec = float(p95_ms) / 1000.0
-            print(f"[Latency] p95≈{p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
-            GLOBAL_P95_LATENCY = new_latency_sec
-        # else: don't overwrite, keep last good value
+        if not p95_ms or p95_ms <= 0:
+            # nothing useful – keep last EMA value
+            print("[Latency] p95 missing or non-positive, keeping previous EMA")
+            return
+
+        observed_sec = float(p95_ms) / 1000.0
+
+        # EMA smoothing
+        if GLOBAL_P95_LATENCY <= 0:
+            GLOBAL_P95_LATENCY = observed_sec
+        else:
+            GLOBAL_P95_LATENCY = (
+                LATENCY_EWMA_ALPHA * observed_sec +
+                (1.0 - LATENCY_EWMA_ALPHA) * GLOBAL_P95_LATENCY
+            )
+
+        print(f"[Latency] p95≈{p95_ms:.1f} ms → EMA={GLOBAL_P95_LATENCY:.3f} s")
 
     except Exception as e:
         print(f"[Latency] Failed to fetch from Locust: {e}")
         # keep last good value
-
 
 
 def get_metrics(service):
@@ -241,12 +259,19 @@ class QLearningAgent:
     """
     Advanced Q-Learning Agent for Kubernetes Autoscaling
 
-    Features:
-    - Multi-dimensional state space
-    - Adaptive exploration (epsilon decay)
-    - Experience replay for stability
-    - State visit counting for exploration bonus
-    - Q-value initialization strategies
+    State features:
+      - cpu_util (0..2 bucket)
+      - cpu_trend (down / flat / up)
+      - latency_score (0..2 bucket)
+      - latency_trend (down / flat / up)
+      - pod_ratio (0..2 bucket)
+      - pod_trend (down / flat / up)
+      - mem_util (0..2 bucket)
+
+    Actions:
+      0: SCALE_DOWN
+      1: NO_CHANGE
+      2: SCALE_UP
     """
 
     def __init__(
@@ -257,271 +282,216 @@ class QLearningAgent:
         epsilon_decay=0.995,
         epsilon_min=0.01,
         use_replay=True,
-        replay_size=100
+        replay_size=200
     ):
-        # Core Q-Learning parameters
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
 
-        # Q-table: state -> [Q(down), Q(stay), Q(up)]
+        # Q-table: state (tuple) -> [Q(down), Q(stay), Q(up)]
         self.q_table = {}
 
         # Visit counts for exploration bonus
         self.state_visits = defaultdict(int)
 
-        # Experience replay buffer
+        # Experience replay
         self.use_replay = use_replay
         self.replay_buffer = deque(maxlen=replay_size)
 
-        # Statistics tracking
         self.total_steps = 0
         self.total_updates = 0
 
-        # Action space
-        self.actions = {
-            0: "SCALE_DOWN",
-            1: "NO_CHANGE",
-            2: "SCALE_UP"
-        }
+        self.actions = {0: "SCALE_DOWN", 1: "NO_CHANGE", 2: "SCALE_UP"}
 
-        # State space discretization thresholds
-        self.cpu_thresholds = [0.3, 0.7]    # Low/Med/High
-        self.lat_thresholds = [0.8, 1.2]    # Good/OK/Bad
-        self.pod_thresholds = [0.3, 0.7]    # Few/Med/Many
-        self.mem_thresholds = [0.4, 0.8]    # Low/Med/High
+        # Discretization thresholds
+        self.cpu_thresholds = [0.3, 0.7]     # Low / Med / High
+        self.lat_thresholds = [0.8, 1.2]     # <target / ~target / >target
+        self.pod_thresholds = [0.3, 0.7]     # Few / Med / Many
+        self.mem_thresholds = [0.4, 0.8]     # Low / Med / High
+
+        # Trend cutoffs (per minute-ish, but we just use dimensionless)
+        self.trend_neg = -0.05
+        self.trend_pos = 0.05
 
     def discretize_value(self, value, thresholds):
-        """Convert continuous value to discrete bucket."""
-        for i, threshold in enumerate(thresholds):
-            if value < threshold:
+        for i, thr in enumerate(thresholds):
+            if value < thr:
                 return i
         return len(thresholds)
 
-    def get_state(self, cpu_util, latency_score, pod_ratio, mem_util=None):
+    def discretize_trend(self, dv):
         """
-        Convert continuous metrics to discrete state.
+        Map continuous trend to 3 buckets:
+          0: decreasing
+          1: flat
+          2: increasing
+        """
+        if dv < self.trend_neg:
+            return 0
+        elif dv > self.trend_pos:
+            return 2
+        return 1
 
-        Args:
-            cpu_util: CPU utilization (0-1+)
-            latency_score: Latency vs target (0-2+)
-            pod_ratio: Current pods / max pods (0-1)
-            mem_util: Optional memory utilization (0-1+)
-        """
+    def get_state(
+        self,
+        cpu_util,
+        latency_score,
+        pod_ratio,
+        mem_util=None,
+        cpu_trend=0.0,
+        lat_trend=0.0,
+        pod_trend=0.0
+    ):
         cpu_state = self.discretize_value(cpu_util, self.cpu_thresholds)
         lat_state = self.discretize_value(latency_score, self.lat_thresholds)
         pod_state = self.discretize_value(pod_ratio, self.pod_thresholds)
+        mem_state = self.discretize_value(
+            mem_util if mem_util is not None else 0.0,
+            self.mem_thresholds
+        )
 
-        if mem_util is not None:
-            mem_state = self.discretize_value(mem_util, self.mem_thresholds)
-            return (cpu_state, lat_state, pod_state, mem_state)
+        cpu_tr_state = self.discretize_trend(cpu_trend)
+        lat_tr_state = self.discretize_trend(lat_trend)
+        pod_tr_state = self.discretize_trend(pod_trend)
 
-        return (cpu_state, lat_state, pod_state)
+        # 7-dimensional discrete state
+        return (
+            cpu_state,
+            cpu_tr_state,
+            lat_state,
+            lat_tr_state,
+            pod_state,
+            pod_tr_state,
+            mem_state,
+        )
 
     def _init_q_values(self, state):
         """
-        Initialize Q-values for new state with intelligent defaults.
-
-        Uses optimistic initialization to encourage exploration.
+        Optimistic initialization to encourage exploration.
+        Slight bias:
+          - High CPU or high latency → prefer SCALE_UP initially
+          - Low CPU & low latency & many pods → prefer SCALE_DOWN
         """
-        # Start with slight optimism for all actions
-        q_values = [0.1, 0.0, 0.1]  # [down, stay, up]
+        # default: slight optimism
+        q_values = [0.1, 0.0, 0.1]
 
-        cpu_state, lat_state, pod_state = state[:3]
+        cpu_state, cpu_tr, lat_state, lat_tr, pod_state, pod_tr, mem_state = state
 
-        # High CPU/Latency -> Bias toward scaling up
-        if cpu_state >= 2 or lat_state >= 2:
-            q_values[2] = 0.5  # Scale up more attractive
-            q_values[0] = -0.2  # Scale down less attractive
-
-        # Low CPU/Good latency + Many pods -> Bias toward scaling down
+        if lat_state >= 2 or cpu_state >= 2:
+            # clearly overloaded → scaling up is attractive
+            q_values[2] = 0.6
+            q_values[0] = -0.2
         elif cpu_state == 0 and lat_state == 0 and pod_state >= 2:
-            q_values[0] = 0.5  # Scale down more attractive
-            q_values[2] = -0.2  # Scale up less attractive
-
-        # Medium states -> Prefer stability
+            # overprovisioned but healthy → scaling down is attractive
+            q_values[0] = 0.6
+            q_values[2] = -0.2
         else:
-            q_values[1] = 0.2  # No change slightly preferred
+            # neutral → slight preference to stability
+            q_values[1] = 0.2
 
         return q_values
 
     def choose_action(self, state, force_exploit=False):
-        """
-        Epsilon-greedy action selection with exploration bonus.
-
-        Returns: action index (0=down, 1=stay, 2=up)
-        """
-        # Initialize Q-values if new state
+        # Initialize new state
         if state not in self.q_table:
             self.q_table[state] = self._init_q_values(state)
 
-        # Increment visit count
         self.state_visits[state] += 1
         self.total_steps += 1
 
-        # Epsilon-greedy selection
         if not force_exploit and np.random.random() < self.epsilon:
-            # Weighted random to slightly prefer "no change"
-            weights = [0.3, 0.4, 0.3]
-            action = np.random.choice([0, 1, 2], p=weights)
-        else:
-            # Exploitation: choose best action
-            q_values = self.q_table[state]
+            # exploration, small bias towards NO_CHANGE
+            return np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
 
-            # Small exploration bonus based on visit count (UCB-like)
-            exploration_bonus = 0.1 / np.sqrt(self.state_visits[state])
-            adjusted_q = [q + exploration_bonus for q in q_values]
+        q_values = self.q_table[state]
+        bonus = 0.1 / np.sqrt(self.state_visits[state])
+        adjusted = [q + bonus for q in q_values]
 
-            max_q = max(adjusted_q)
-            max_actions = [
-                i for i, q in enumerate(adjusted_q)
-                if abs(q - max_q) < 1e-6
-            ]
-            action = np.random.choice(max_actions)
-
-        return action
+        max_q = max(adjusted)
+        best_actions = [i for i, q in enumerate(adjusted) if abs(q - max_q) < 1e-6]
+        return np.random.choice(best_actions)
 
     def learn(self, state, action, reward, next_state):
-        """Update Q-values using Q-learning update rule."""
-        # Initialize states if needed
         if state not in self.q_table:
             self.q_table[state] = self._init_q_values(state)
         if next_state not in self.q_table:
             self.q_table[next_state] = self._init_q_values(next_state)
 
-        # Store experience for replay
         if self.use_replay:
             self.replay_buffer.append((state, action, reward, next_state))
 
-        # Standard Q-learning update
         old_q = self.q_table[state][action]
-        next_max_q = max(self.q_table[next_state])
-        new_q = old_q + self.alpha * (reward + self.gamma * next_max_q - old_q)
+        next_max = max(self.q_table[next_state])
+        new_q = old_q + self.alpha * (reward + self.gamma * next_max - old_q)
         self.q_table[state][action] = new_q
-
         self.total_updates += 1
 
-        # Experience replay
-        if self.use_replay and len(self.replay_buffer) >= 10:
+        if self.use_replay and len(self.replay_buffer) >= 20:
             self._replay_learn()
 
-    def _replay_learn(self, n_samples=5):
-        """Learn from randomly sampled past experiences."""
+    def _replay_learn(self, n_samples=8):
         samples = min(n_samples, len(self.replay_buffer))
         for _ in range(samples):
-            idx = np.random.randint(len(self.replay_buffer))
-            s, a, r, ns = self.replay_buffer[idx]
-
+            s, a, r, ns = self.replay_buffer[np.random.randint(len(self.replay_buffer))]
             old_q = self.q_table[s][a]
-            next_max_q = max(self.q_table[ns])
-            new_q = old_q + self.alpha * (r + self.gamma * next_max_q - old_q)
+            next_max = max(self.q_table[ns])
+            new_q = old_q + self.alpha * (r + self.gamma * next_max - old_q)
             self.q_table[s][a] = new_q
 
     def decay_epsilon(self):
-        """Decay exploration rate."""
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-    def set_epsilon(self, epsilon):
-        """Manually set exploration rate."""
-        self.epsilon = epsilon
-
     def get_best_action(self, state):
-        """Get best action without exploration."""
         return self.choose_action(state, force_exploit=True)
 
     def get_policy(self):
-        """Extract learned policy as a readable dictionary."""
         policy = {}
         for state, q_values in self.q_table.items():
-            best_action_idx = np.argmax(q_values)
+            a = int(np.argmax(q_values))
             policy[state] = {
-                'action': self.actions[best_action_idx],
-                'q_values': q_values,
-                'visits': self.state_visits[state]
+                "action": self.actions[a],
+                "q_values": q_values,
+                "visits": self.state_visits[state],
             }
         return policy
 
     def get_statistics(self):
-        """Get agent statistics for analysis."""
         return {
-            'total_steps': self.total_steps,
-            'total_updates': self.total_updates,
-            'states_discovered': len(self.q_table),
-            'epsilon_current': self.epsilon,
-            'replay_buffer_size': len(self.replay_buffer),
-            'most_visited_states': sorted(
-                self.state_visits.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:5]
+            "total_steps": self.total_steps,
+            "total_updates": self.total_updates,
+            "states_discovered": len(self.q_table),
+            "epsilon_current": self.epsilon,
+            "replay_buffer_size": len(self.replay_buffer),
         }
 
     def save(self, filepath):
-        """Save Q-table and parameters to file."""
         data = {
-            'q_table': {str(k): v for k, v in self.q_table.items()},
-            'state_visits': {str(k): v for k, v in self.state_visits.items()},
-            'parameters': {
-                'alpha': self.alpha,
-                'gamma': self.gamma,
-                'epsilon': self.epsilon,
-                'epsilon_decay': self.epsilon_decay,
-                'epsilon_min': self.epsilon_min
+            "q_table": {str(k): v for k, v in self.q_table.items()},
+            "state_visits": {str(k): v for k, v in self.state_visits.items()},
+            "parameters": {
+                "alpha": self.alpha,
+                "gamma": self.gamma,
+                "epsilon": self.epsilon,
+                "epsilon_decay": self.epsilon_decay,
+                "epsilon_min": self.epsilon_min,
             },
-            'statistics': self.get_statistics()
+            "statistics": self.get_statistics(),
         }
-        with open(filepath, 'w') as f:
+        with open(filepath, "w") as f:
             json.dump(data, f, indent=2)
 
-    def load(self, filepath):
-        """Load Q-table and parameters from file."""
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-
-        self.q_table = {eval(k): v for k, v in data['q_table'].items()}
-        self.state_visits = defaultdict(
-            int,
-            {eval(k): v for k, v in data.get('state_visits', {}).items()}
-        )
-        params = data.get('parameters', {})
-        self.alpha = params.get('alpha', self.alpha)
-        self.gamma = params.get('gamma', self.gamma)
-        self.epsilon = params.get('epsilon', self.epsilon)
-
     def visualize_policy(self):
-        """Generate a human-readable policy summary."""
-        lines = ["=== Q-Learning Policy Summary ===\n"]
-
-        cpu_labels = ["Low", "Med", "High"]
-        lat_labels = ["Good", "OK", "Bad"]
-        pod_labels = ["Few", "Med", "Many"]
-
-        actions_taken = {0: [], 1: [], 2: []}
-        for state, q_values in sorted(self.q_table.items()):
-            best_action = np.argmax(q_values)
-            actions_taken[best_action].append((state, q_values))
-
-        for action_idx, states in actions_taken.items():
-            if states:
-                lines.append(f"\n{self.actions[action_idx]}:")
-                for state, q_values in states[:5]:
-                    cpu_s, lat_s, pod_s = state[:3]
-                    state_desc = (
-                        f"  CPU:{cpu_labels[min(cpu_s, 2)]}, "
-                        f"Lat:{lat_labels[min(lat_s, 2)]}, "
-                        f"Pods:{pod_labels[min(pod_s, 2)]}"
-                    )
-                    q_str = (
-                        f"Q=[{q_values[0]:.2f}, "
-                        f"{q_values[1]:.2f}, "
-                        f"{q_values[2]:.2f}]"
-                    )
-                    visits = self.state_visits[state]
-                    lines.append(f"{state_desc}: {q_str} (visited {visits}x)")
-
-        lines.append(f"\n{self.get_statistics()}")
+        lines = ["=== Q-Learning Policy Summary ==="]
+        for state, q_values in sorted(self.q_table.items(), key=lambda x: self.state_visits[x[0]], reverse=True)[:20]:
+            a = int(np.argmax(q_values))
+            lines.append(
+                f"State={state}, best={self.actions[a]}, "
+                f"Q=[{q_values[0]:.2f},{q_values[1]:.2f},{q_values[2]:.2f}], "
+                f"visits={self.state_visits[state]}"
+            )
+        lines.append(str(self.get_statistics()))
         return "\n".join(lines)
 
 # ============================================================
@@ -584,7 +554,7 @@ class CAPAPlusController(threading.Thread):
                     break
                 time.sleep(1)
 
-    def _calculate_reward(
+   def _calculate_reward(
         self,
         svc,
         prev_m,
@@ -594,65 +564,73 @@ class CAPAPlusController(threading.Thread):
         action_taken
     ):
         """
-        Calculate reward based on state transition.
+        Reward design (higher is better):
 
-        Rewards:
-        - Maintaining SLA with fewer pods
-        - Improving latency
-        - Stable CPU utilization (40-70%)
+        + SLA adherence (latency near or below target)
+        + CPU in [40%, 70%]
+        + Fewer pods when SLA is OK
+        + High ready/desired ratio
+        + Improvement in latency vs previous step
 
-        Penalties:
-        - SLA violations
-        - Over/under utilization
-        - Unnecessary scaling actions
+        - Large SLA violations
+        - Very low or very high CPU
+        - Memory pressure
+        - Frequent scaling actions during instability
         """
+
         conf = SERVICE_CONFIGS[svc]
+        lat = curr_scores["latency"]        # ratio vs target
+        cpu = curr_scores["cpu"]
+        mem = curr_scores["memory"]
 
-        # 1) SLA Compliance
-        sla_reward = 0
-        if curr_scores['latency'] <= 1.0:
-            sla_reward = 0.5
+        pods = curr_m["pods"]
+        ready = curr_m["ready_pods"]
+        ready_ratio = ready / max(1, pods)
+
+        reward = 0.0
+
+        # 1) SLA (latency)
+        if lat <= 1.0:
+            reward += 0.6 * (1.0 - lat)      # better if well below target
         else:
-            sla_reward = -2.0 * (curr_scores['latency'] - 1.0)
+            reward -= 1.2 * (lat - 1.0)      # strong penalty above target
 
-        # 2) Resource Efficiency (if SLA met)
-        efficiency_reward = 0
-        if curr_scores['latency'] <= 1.0:
-            pods_normalized = curr_m['pods'] / conf['max']
-            efficiency_reward = (1.0 - pods_normalized) * 0.5
+        # 2) CPU efficiency
+        if 0.4 <= cpu <= 0.7:
+            reward += 0.4
+        elif cpu < 0.2:
+            reward -= 0.3
+        elif cpu > 0.9:
+            reward -= 0.4
 
-        # 3) CPU Utilization
-        cpu_reward = 0
-        cpu_util = curr_scores['cpu']
-        if 0.4 <= cpu_util <= 0.7:
-            cpu_reward = 0.3
-        elif cpu_util < 0.2:
-            cpu_reward = -0.3
-        elif cpu_util > 0.9:
-            cpu_reward = -0.5
+        # 3) Memory pressure
+        if mem > 0.9:
+            reward -= 0.5
+        elif mem > 0.75:
+            reward -= 0.2
 
-        # 4) Stability penalty
-        stability_penalty = 0
-        if action_taken == 0:
-            stability_penalty = -0.05
-        elif action_taken == 2:
-            stability_penalty = -0.1
+        # 4) Ready pods vs ordered (warmup)
+        reward += 0.4 * ready_ratio
+        if ready_ratio < 0.5 and action_taken == 2:
+            # scaled up but still most pods not ready → slight penalty
+            reward -= 0.3
 
-        # 5) Improvement bonus
-        improvement_bonus = 0
-        if prev_scores and curr_scores:
-            lat_improved = prev_scores['latency'] - curr_scores['latency']
-            if lat_improved > 0.1:
-                improvement_bonus = 0.3
+        # 5) Stability / scaling cost
+        if action_taken == 2:       # SCALE_UP
+            reward -= 0.1
+        elif action_taken == 0:     # SCALE_DOWN
+            reward -= 0.05
 
-        total_reward = (
-            sla_reward +
-            efficiency_reward +
-            cpu_reward +
-            stability_penalty +
-            improvement_bonus
-        )
-        return total_reward
+        # 6) Improvement vs previous latency
+        if prev_scores is not None:
+            prev_lat = prev_scores["latency"]
+            delta_lat = prev_lat - lat
+            if delta_lat > 0.1:     # noticeable improvement
+                reward += 0.3
+            elif delta_lat < -0.1:  # noticeable regression
+                reward -= 0.3
+
+        return reward
 
     def _process_service(self, svc, current_time, elapsed, current_users):
         """
@@ -687,14 +665,14 @@ class CAPAPlusController(threading.Thread):
         # Pod ratio
         pod_ratio = m['pods'] / conf['max'] if conf['max'] > 0 else 0
 
-        # Clamp values to reasonable ranges
-        score_cpu = max(0.0, min(score_cpu, 2.0))
-        score_lat = max(0.0, min(score_lat, 5.0))
-        score_mem = max(0.0, min(score_mem, 2.0))
-        pod_ratio = max(0.0, min(pod_ratio, 1.0))
+        # Clamp to sane ranges
+        score_cpu = float(max(0.0, min(score_cpu, 2.0)))
+        score_lat = float(max(0.0, min(score_lat, 5.0)))
+        score_mem = float(max(0.0, min(score_mem, 2.0)))
+        pod_ratio = float(max(0.0, min(pod_ratio, 1.0)))
 
-        # Predictive score (optional)
-        predictive_util = 0
+        # Predictive (unchanged, optional)
+        predictive_util = 0.0
         if svc in self.models and current_users > 0:
             try:
                 future_time = elapsed + 60
@@ -704,11 +682,9 @@ class CAPAPlusController(threading.Thread):
                 )
                 predicted_cpu = self.models[svc].predict(input_df)[0]
                 total_capacity = m['pods'] * cpu_limit
-                predictive_util = (
-                    predicted_cpu / total_capacity if total_capacity > 0 else 0
-                )
+                predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
             except Exception:
-                predictive_util = 0
+                predictive_util = 0.0
 
         current_scores = {
             'cpu': score_cpu,
@@ -716,14 +692,31 @@ class CAPAPlusController(threading.Thread):
             'latency': score_lat,
             'predictive': predictive_util
         }
+        # ----------------- TRENDS -----------------
+        cpu_trend = 0.0
+        lat_trend = 0.0
+        pod_trend = 0.0
 
+        if self.last_metrics[svc] is not None:
+            prev_metrics = self.last_metrics[svc]['metrics']
+            prev_scores = self.last_metrics[svc]['scores']
+            prev_elapsed = self.last_metrics[svc]['elapsed']
+
+            dt = max(1.0, elapsed - prev_elapsed)
+
+            cpu_trend = (score_cpu - prev_scores['cpu']) / dt
+            lat_trend = (score_lat - prev_scores['latency']) / dt
+            pod_trend = (m['pods'] - prev_metrics['pods']) / dt
         # ----------------- Q-LEARNING -----------------
         agent = self.rl_agents[svc]
         current_state = agent.get_state(
             cpu_util=score_cpu,
             latency_score=score_lat,
             pod_ratio=pod_ratio,
-            mem_util=score_mem
+            mem_util=score_mem,
+            cpu_trend=cpu_trend,
+            lat_trend=lat_trend,
+            pod_trend=pod_trend
         )
 
         # Learn from previous transition
@@ -787,8 +780,10 @@ class CAPAPlusController(threading.Thread):
         self.last_rl_action[svc] = rl_action
         self.last_metrics[svc] = {
             'metrics': m.copy(),
-            'scores': current_scores.copy()
+            'scores': current_scores.copy(),
+            'elapsed': elapsed
         }
+
 
         # ----------------- PLAN (SAFETY) -----------------
         if svc not in self.last_scale_time:
@@ -808,14 +803,15 @@ class CAPAPlusController(threading.Thread):
             safety_override = True
 
         # Safety: not enough ready pods to safely scale up
-        if m['ready_pods'] < m['pods'] * 0.5 and rl_action == 2:
+        ready_ratio = m['ready_pods'] / max(1, m['pods'])
+        if rl_action == 2 and ready_ratio < 0.4 and score_lat < 3.0:
+            # If we are already in extreme latency (>3x), allow UP even with low readiness.
             print(
-                f"   ⚠️ SAFETY: Only {m['ready_pods']}/{m['pods']} pods ready, "
-                f"forcing NO_CHANGE"
+                f"   ⚠️ SAFETY: Only {m['ready_pods']}/{m['pods']} pods ready "
+                f"and latency not extreme, forcing NO_CHANGE"
             )
             rl_action = 1
             safety_override = True
-
         # Safety: boundaries
         if m['pods'] >= conf['max'] and rl_action == 2:
             rl_action = 1
