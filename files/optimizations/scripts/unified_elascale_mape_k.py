@@ -35,6 +35,11 @@ LOCUST_URL = "http://localhost:8089"
 NAMESPACE = "default"
 OUTPUT_DIR = Path("/home/common/EECS6446_project/files/optimizations/results")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Shared latency value for all services (in SECONDS)
+GLOBAL_P95_LATENCY = 0.0
+
+
+
 
 # Configuration for MAPE-K logic (UPDATED with YAML limits)
 SERVICE_CONFIGS = {
@@ -113,12 +118,42 @@ except Exception:
     print("⚠️ K8s config not found")
     k8s_apps = None
 
+def update_global_latency_from_locust():
+    """
+    Fetch p95 latency from Locust and store it (in seconds)
+    so get_metrics() and RL can use it.
+    """
+    global GLOBAL_P95_LATENCY
+    try:
+        resp = requests.get(f"{LOCUST_URL}/stats/requests", timeout=5)
+        data = resp.json()
+
+        stats_list = data.get("stats", [])
+        if not stats_list:
+            return
+
+        # Usually the first entry is "Total"
+        p95_ms = stats_list[0].get("current_response_time_percentile_95", 0.0)
+
+        # Locust gives ms → convert to seconds for RL controller
+        GLOBAL_P95_LATENCY = float(p95_ms) / 1000.0
+
+    except Exception as e:
+        print(f"[Latency] Failed to fetch from Locust: {e}")
+        # Keep last good value; do not reset to 0 so RL doesn't think latency is perfect.
 
 def get_metrics(service):
     """Get metrics with proper error handling."""
-    m = {'cpu': 0.0, 'mem': 0.0, 'pods': 0, 'ready_pods': 0, 'latency': 0.0}
+    m = {
+        'cpu': 0.0,
+        'mem': 0.0,
+        'pods': 0,
+        'ready_pods': 0,
+        'latency': 0.0,   # seconds
+    }
+
     try:
-        # CPU (millicores)
+        # ---------- CPU (millicores) ----------
         q_cpu = (
             f'sum(rate(container_cpu_usage_seconds_total'
             f'{{pod=~"{service}-.*",container="server",namespace="{NAMESPACE}"}}[1m])) * 1000'
@@ -131,7 +166,7 @@ def get_metrics(service):
         if res.get('data', {}).get('result'):
             m['cpu'] = float(res['data']['result'][0]['value'][1])
 
-        # Memory (bytes)
+        # ---------- Memory (bytes) ----------
         q_mem = (
             f'sum(container_memory_usage_bytes'
             f'{{pod=~"{service}-.*",container="server",namespace="{NAMESPACE}"}})'
@@ -144,21 +179,11 @@ def get_metrics(service):
         if res.get('data', {}).get('result'):
             m['mem'] = float(res['data']['result'][0]['value'][1])
 
-        # Latency (p95)
-        q_lat = (
-            'histogram_quantile(0.95, '
-            f'sum(rate(http_request_duration_seconds_bucket'
-            f'{{app="{service}",namespace="{NAMESPACE}"}}[1m])) by (le))'
-        )
-        res = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query",
-            params={'query': q_lat},
-            timeout=10
-        ).json()
-        if res.get('data', {}).get('result'):
-            m['latency'] = float(res['data']['result'][0]['value'][1])
+        # ---------- Latency (p95 from Locust, in seconds) ----------
+        # RL uses this with: score_lat = m['latency'] / latency_target_seconds
+        m['latency'] = GLOBAL_P95_LATENCY
 
-        # Deployment status
+        # ---------- Deployment status (pods / ready_pods) ----------
         if k8s_apps:
             deploy = k8s_apps.read_namespaced_deployment(service, NAMESPACE)
             m['pods'] = deploy.status.replicas or 0
@@ -166,7 +191,9 @@ def get_metrics(service):
 
     except Exception as e:
         print(f"Metrics error for {service}: {e}")
+
     return m
+
 
 
 def scale_deployment(service, replicas):
@@ -531,6 +558,7 @@ class CAPAPlusController(threading.Thread):
         while self.running:
             current_time = time.time()
             elapsed = current_time - self.experiment_start_time
+            update_global_latency_from_locust()
             current_users = get_current_user_load()
 
             for svc in SERVICES:
