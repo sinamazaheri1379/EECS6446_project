@@ -134,7 +134,8 @@ def update_global_latency_from_locust():
 
         # Usually the first entry is "Total"
         p95_ms = stats_list[0].get("current_response_time_percentile_95", 0.0)
-
+        if p95_ms > 0:
+             print(f"[Latency] p95={p95_ms:.1f} ms ({GLOBAL_P95_LATENCY:.3f} s)")
         # Locust gives ms → convert to seconds for RL controller
         GLOBAL_P95_LATENCY = float(p95_ms) / 1000.0
 
