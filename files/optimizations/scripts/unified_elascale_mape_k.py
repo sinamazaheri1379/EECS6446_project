@@ -55,18 +55,18 @@ def get_metrics(service):
     try:
         # Fix 6: Filter by container="server" to exclude sidecars
         q_cpu = f'sum(rate(container_cpu_usage_seconds_total{{pod=~"{service}-.*",container="server",namespace="{NAMESPACE}"}}[1m])) * 1000'
-        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_cpu}, timeout=5).json()
+        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_cpu}, timeout=15).json()
         if res.get('data', {}).get('result'):
             m['cpu'] = float(res['data']['result'][0]['value'][1])
 
         q_mem = f'sum(container_memory_usage_bytes{{pod=~"{service}-.*",container="server",namespace="{NAMESPACE}"}})'
-        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_mem}, timeout=5).json()
+        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_mem}, timeout=15).json()
         if res.get('data', {}).get('result'):
             m['mem'] = float(res['data']['result'][0]['value'][1])
 
         # Latency (P95)
         q_lat = f'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{app="{service}",namespace="{NAMESPACE}"}}[1m])) by (le))'
-        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_lat}, timeout=5).json()
+        res = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': q_lat}, timeout=15).json()
         if res.get('data', {}).get('result'):
             m['latency'] = float(res['data']['result'][0]['value'][1])
         
