@@ -41,7 +41,12 @@ SERVICE_CONFIGS = {
 }
 
 SERVICES = list(SERVICE_CONFIGS.keys())
-LOAD_STEPS = [(50, 60), (100, 60), (500, 60), (1000, 180), (500, 60), (100, 60), (50, 60)]
+# LOAD_STEPS = [(50, 60), (100, 60), (500, 60), (1000, 180), (500, 60), (100, 60), (50, 60)]
+LOAD_STEPS = [
+    (50, 60),       # Warm-up: 1 min to initialize pods/caches
+    (1000, 1800),   # STEADY STATE: 1000 users for 30 minutes (1800s)
+    (50, 60)        # Cool-down: 1 min to verify scale-down
+]
 
 try:
     config.load_kube_config()
