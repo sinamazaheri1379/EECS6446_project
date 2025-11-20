@@ -197,16 +197,6 @@ class CAPAPlusController(threading.Thread):
         self.models = {}
         self.experiment_start_time = time.time()
         
-        # Load Predictive Models
-        for svc in ['frontend', 'cartservice', 'checkoutservice']:
-            model_path = f"models/{svc}_cpu_predictor.pkl"
-            if os.path.exists(model_path):
-                try:
-                    self.models[svc] = joblib.load(model_path)
-                    print(f"   ✓ Loaded model for {svc}")
-                except Exception as e:
-                    print(f"   ✗ Model load error for {svc}: {e}")
-        
     def run(self):
         print("\n>>> CAPA+ Controller Started (Multi-Metric + Predictive + Cost-Aware) <<<")
         print("Optimization Features Active:")
@@ -231,51 +221,26 @@ class CAPAPlusController(threading.Thread):
 
     def _process_service(self, svc, current_time, elapsed, current_users):
         """MAPE-K Loop for a single service"""
-        
-        # --- MONITOR ---
         m = get_metrics(svc)
         if m['pods'] == 0:
-            return  # Skip if no pods
+            return
         
         conf = SERVICE_CONFIGS[svc]
-        
-        # --- ANALYZE (Level 4: Multi-Metric) ---
-        
-        # Priority 3 Fix: Use Ready Pods for capacity calculation to avoid death spirals
         active_capacity_count = max(1, m['ready_pods'])
         
-        # 1. CPU Score
+        # Calculate scores
         cpu_limit = conf['cpu_limit_millicores']
         score_cpu = m['cpu'] / (active_capacity_count * cpu_limit)
         
-        # 2. Memory Score
         mem_limit = conf.get('mem_limit_bytes', 500000000)
         score_mem = m['mem'] / (active_capacity_count * mem_limit)
         
-        # 3. Latency Score
         lat_target = conf.get('latency_target_seconds', 0.5)
         score_lat = m['latency'] / lat_target if lat_target > 0 else 0
         
-        # 4. Predictive Score
-        predictive_util = 0
-        if svc in self.models and current_users > 0:
-            try:
-                future_time = elapsed + 60
-                input_df = pd.DataFrame(
-                    [[current_users, future_time]], 
-                    columns=['scenario_users', 'elapsed_total_seconds']
-                )
-                predicted_cpu = self.models[svc].predict(input_df)[0]
-                # Predict against *Ordered* capacity (assuming they will be ready)
-                total_capacity = m['pods'] * cpu_limit
-                predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
-            except Exception:
-                pass 
-        
-        # Priority 1 Fix: Weighted Average Strategy
-        final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat) + (0.1 * predictive_util)
+        # Weighted average
+        final_score = (0.5 * score_cpu) + (0.2 * score_mem) + (0.2 * score_lat)
 
-        # --- PLAN ---
         if svc not in self.last_scale_time:
             self.last_scale_time[svc] = 0
             self.last_scale_action[svc] = 'none'
@@ -283,44 +248,30 @@ class CAPAPlusController(threading.Thread):
         target = m['pods']
         action = 'none'
         
-        # Scale UP (Aggressive)
+        # Scaling logic
         if final_score > conf['scale_up_threshold']:
             if self.last_scale_action[svc] == 'down' and (current_time - self.last_scale_time[svc]) < 60:
-                print(f"[{svc}] Scale UP suppressed (recent scale-down)")
                 return
             
             target += conf['scale_up_increment']
             action = 'up'
-            reason = f"Score={final_score:.2f} (CPU:{score_cpu:.2f} Lat:{score_lat:.2f} Pred:{predictive_util:.2f})"
-            print(f"[{svc}] Scale UP: {m['pods']} → {target} | {reason}")
+            print(f"[{svc}] Scale UP: {m['pods']} → {target} | Score={final_score:.2f}")
             self.last_scale_time[svc] = current_time
             self.last_scale_action[svc] = 'up'
             
-        # Scale DOWN (Conservative)
         elif final_score < conf['scale_down_threshold']:
-            stabilization_window = 300
-            if self.last_scale_action[svc] == 'up':
-                stabilization_window = 600
+            stabilization_window = 300 if self.last_scale_action[svc] != 'up' else 600
             
             if current_time - self.last_scale_time[svc] > stabilization_window:
                 target -= conf['scale_down_increment']
                 action = 'down'
-                print(f"[{svc}] Scale DOWN: {m['pods']} → {target} | Score={final_score:.2f} (Stable)")
+                print(f"[{svc}] Scale DOWN: {m['pods']} → {target} | Score={final_score:.2f}")
                 self.last_scale_time[svc] = current_time
                 self.last_scale_action[svc] = 'down'
-            else:
-                pass
 
-        # --- EXECUTE ---
         if action != 'none':
             target = max(conf['min'], min(target, conf['max']))
-            
             if target != m['pods']:
-                # Cost Awareness Logic
-                node_tier = "Burstable (Cheap)"
-                if target > 10:
-                    node_tier = "On-Demand (Expensive)"
-                print(f"   [COST] {svc} scaling to {target} on {node_tier} tier")
                 scale_deployment(svc, target)
         
     def stop(self):
@@ -383,7 +334,7 @@ def run_experiment_phase(config_name):
             while time.time() < end_step:
                 now = time.time()
                 
-                # --- COLLECT DATA FOR CSV ---
+                # Collect data
                 row = {
                     "timestamp": datetime.now().isoformat(),
                     "config": config_name,
@@ -391,60 +342,110 @@ def run_experiment_phase(config_name):
                     "scenario_users": users,
                 }
                 
-                # Locust Data (Robust Fix applied here)
+                # ===== FIXED LOCUST METRICS EXTRACTION =====
                 try:
                     stats = requests.get(f"{LOCUST_URL}/stats/requests").json()
+                    
+                    # Basic metrics (these usually work)
                     row["throughput_rps"] = stats.get('total_rps', 0)
                     row["fault_rate_percent"] = stats.get('fail_ratio', 0) * 100
+                    row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
                     
-                    # FIX: Robust extraction for Avg Response Time with Type Safety
+                    # FIXED: Comprehensive extraction for Average Response Time
                     avg_resp = 0
-                    if 'total_avg_response_time' in stats:
-                         avg_resp = stats['total_avg_response_time']
+                    
+                    # Method 1: Check top-level fields (most common)
+                    if 'current_response_time_average' in stats:
+                        avg_resp = stats['current_response_time_average']
+                    elif 'total_avg_response_time' in stats:
+                        avg_resp = stats['total_avg_response_time']
+                    elif 'avg_response_time' in stats:
+                        avg_resp = stats['avg_response_time']
+                    elif 'average_response_time' in stats:
+                        avg_resp = stats['average_response_time']
                     else:
+                        # Method 2: Check stats array
                         stats_list = stats.get('stats', [])
-                        if isinstance(stats_list, list):
+                        if isinstance(stats_list, list) and len(stats_list) > 0:
+                            # Look for aggregate entry
+                            found = False
                             for entry in stats_list:
-                                if isinstance(entry, dict) and entry.get('name') == 'Total':
-                                    avg_resp = entry.get('avg_response_time', 0)
-                                    break
+                                if isinstance(entry, dict):
+                                    name = entry.get('name', '').lower()
+                                    # Check various aggregate entry names
+                                    if 'total' in name or 'aggregat' in name or name == '/':
+                                        # Try multiple field names
+                                        for field in ['avg_response_time', 'average_response_time', 
+                                                    'mean_response_time', 'avg']:
+                                            if field in entry and entry[field] > 0:
+                                                avg_resp = entry[field]
+                                                found = True
+                                                break
+                                        if found:
+                                            break
+                            
+                            # Last resort: try last entry (often aggregate)
+                            if not found and len(stats_list) > 0:
+                                last = stats_list[-1]
+                                if isinstance(last, dict):
+                                    for field in ['avg_response_time', 'average_response_time', 'mean_response_time']:
+                                        if field in last:
+                                            avg_resp = last[field]
+                                            break
+                    
                     row["avg_response_time_ms"] = avg_resp
                     
-                    row["p95_response_time_ms"] = stats.get('current_response_time_percentile_95', 0)
+                    # Debug output if still zero with traffic
+                    if avg_resp == 0 and row["throughput_rps"] > 0:
+                        print(f"   ⚠️ No avg response time (have {row['throughput_rps']:.1f} rps)")
+                        # Save raw response for debugging
+                        with open('/tmp/locust_debug.json', 'w') as f:
+                            json.dump(stats, f, indent=2)
+                        print(f"      Debug data saved to /tmp/locust_debug.json")
+                        
                 except Exception as e:
                     print(f"Locust stats error: {e}")
                     row["throughput_rps"] = 0
                     row["fault_rate_percent"] = 0
                     row["avg_response_time_ms"] = 0
                     row["p95_response_time_ms"] = 0
-
-                # Service Data
+                
+                # Service metrics
                 for svc in SERVICES:
                     m = get_metrics(svc)
                     row[f"{svc}_cpu_millicores"] = m['cpu']
                     row[f"{svc}_memory_bytes"] = m['mem']
                     row[f"{svc}_replicas_ordered"] = m['pods']
-                    row[f"{svc}_replicas_ready"] = m['ready_pods'] 
+                    row[f"{svc}_replicas_ready"] = m['ready_pods']
                     
                     limit = SERVICE_CONFIGS[svc]['cpu_limit_millicores']
                     ready_count = max(1, m['ready_pods'])
-                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100 if m['pods'] > 0 else 0
+                    row[f"{svc}_cpu_percent"] = (m['cpu'] / (ready_count * limit)) * 100 if ready_count > 0 else 0
                 
                 rows.append(row)
-                time.sleep(5) # Sample rate
+                time.sleep(5)
                 
     finally:
         requests.get(f"{LOCUST_URL}/stop")
-        if controller: controller.stop()
+        if controller: 
+            controller.stop()
 
-    # 3. Save Compatible CSV
+    # Save results
     df = pd.DataFrame(rows)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = OUTPUT_DIR / f"{config_name}_complete_{ts}.csv"
     df.to_csv(filename, index=False)
     print(f"   -> Saved: {filename}")
+    
+    # Show summary of response times
+    if len(df) > 0:
+        avg_rt = df['avg_response_time_ms'].mean()
+        max_rt = df['avg_response_time_ms'].max()
+        print(f"\n   Summary - Avg Response Time: {avg_rt:.1f} ms (max: {max_rt:.1f} ms)")
+        if avg_rt == 0:
+            print("   ⚠️ WARNING: All response times are zero! Check Locust configuration.")
+    
     return filename
-
 # ============================================================
 # MAIN
 # ============================================================
