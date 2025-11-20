@@ -104,7 +104,7 @@ SERVICES = list(SERVICE_CONFIGS.keys())
 # Load Pattern (Can be modified for steady state)
 LOAD_STEPS = [
     (50, 60), (100, 60), (500, 60),
-    (1000, 1200),  # Peak
+    (1000, 180),  # Peak
     (500, 60), (100, 60), (50, 60)
 ]
 
@@ -119,35 +119,25 @@ except Exception:
     k8s_apps = None
 
 def update_global_latency_from_locust():
-    """
-    Fetch p95 latency from Locust and store it (in seconds)
-    so get_metrics() and RL can use it.
-    """
     global GLOBAL_P95_LATENCY
     try:
         resp = requests.get(f"{LOCUST_URL}/stats/requests", timeout=5)
         data = resp.json()
 
-        stats_list = data.get("stats", [])
-        if not stats_list:
+        p95_ms = data.get("current_response_time_percentile_95", None)
+
+        if p95_ms is None:
+            print("[Latency] p95 missing or null. Locust likely has 0 users running.")
             return
 
-        # First entry usually "Total"
-        p95_ms = stats_list[0].get("current_response_time_percentile_95", 0.0)
-
-        # Convert NEW value BEFORE printing
         new_latency_sec = float(p95_ms) / 1000.0
 
-        # Debug print with NEW value
-        if p95_ms > 0:
-            print(f"[Latency] p95={p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
+        print(f"[Latency] p95={p95_ms:.1f} ms ({new_latency_sec:.3f} s)")
 
-        # Update global shared latency
         GLOBAL_P95_LATENCY = new_latency_sec
 
     except Exception as e:
         print(f"[Latency] Failed to fetch from Locust: {e}")
-        # Keep last good latency value
 
 
 def get_metrics(service):
