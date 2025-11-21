@@ -335,63 +335,36 @@ class QLearningAgent:
         return 1
 
     def get_state(
-        self,
-        cpu_util,
-        latency_score,
-        pod_ratio,
-        mem_util=None,
-        cpu_trend=0.0,
-        lat_trend=0.0,
-        pod_trend=0.0
-    ):
-        cpu_state = self.discretize_value(cpu_util, self.cpu_thresholds)
-        lat_state = self.discretize_value(latency_score, self.lat_thresholds)
-        pod_state = self.discretize_value(pod_ratio, self.pod_thresholds)
-        mem_state = self.discretize_value(
-            mem_util if mem_util is not None else 0.0,
-            self.mem_thresholds
-        )
+       self,
+       cpu_util,
+       latency_score,
+       pod_ratio,
+       mem_util=None,
+       cpu_trend=0.0,
+       lat_trend=0.0,
+       pod_trend=0.0
+     ):
+       cpu_state = self.discretize_value(cpu_util, self.cpu_thresholds)
+       lat_state = self.discretize_value(latency_score, self.lat_thresholds)
+       pod_state = self.discretize_value(pod_ratio, self.pod_thresholds)
 
-        cpu_tr_state = self.discretize_trend(cpu_trend)
-        lat_tr_state = self.discretize_trend(lat_trend)
-        pod_tr_state = self.discretize_trend(pod_trend)
-
-        # 7-dimensional discrete state
-        return (
-            cpu_state,
-            cpu_tr_state,
-            lat_state,
-            lat_tr_state,
-            pod_state,
-            pod_tr_state,
-            mem_state,
-        )
+       # Simplified state (no trends, no memory for now)
+       return (cpu_state, lat_state, pod_state)
 
     def _init_q_values(self, state):
-        """
-        Optimistic initialization to encourage exploration.
-        Slight bias:
-          - High CPU or high latency → prefer SCALE_UP initially
-          - Low CPU & low latency & many pods → prefer SCALE_DOWN
-        """
-        # default: slight optimism
-        q_values = [0.1, 0.0, 0.1]
+       # neutral initialization: mild preference for NO_CHANGE
+       q_values = [0.0, 0.1, 0.0]
 
-        cpu_state, cpu_tr, lat_state, lat_tr, pod_state, pod_tr, mem_state = state
+       cpu_state, lat_state, pod_state = state
 
-        if lat_state >= 2 or cpu_state >= 2:
-            # clearly overloaded → scaling up is attractive
-            q_values[2] = 0.6
-            q_values[0] = -0.2
-        elif cpu_state == 0 and lat_state == 0 and pod_state >= 2:
-            # overprovisioned but healthy → scaling down is attractive
-            q_values[0] = 0.6
-            q_values[2] = -0.2
-        else:
-            # neutral → slight preference to stability
-            q_values[1] = 0.2
+       # mild hints only in extreme cases
+       if lat_state >= 2 and cpu_state >= 1:
+           q_values[2] = 0.2  # slight push toward scale up under true overload
+       elif lat_state == 0 and cpu_state == 0 and pod_state == 2:
+           q_values[0] = 0.2  # slight push toward scale down when very idle
 
-        return q_values
+       return q_values
+
 
     def choose_action(self, state, force_exploit=False):
        # Initialize new state
@@ -536,6 +509,7 @@ class CAPAPlusController(threading.Thread):
         self.last_rl_action = {svc: None for svc in SERVICES}
         self.last_metrics = {svc: None for svc in SERVICES}
         self.rl_metrics = {svc: [] for svc in SERVICES}
+        self.last_executed_action = {svc: None for svc in SERVICES}
 
         # Load predictive models if available
         for svc in ['frontend', 'cartservice', 'checkoutservice']:
@@ -642,8 +616,9 @@ class CAPAPlusController(threading.Thread):
            reward -= 0.2
        elif action_taken == 0:   # SCALE DOWN
            reward -= 0.1
-
-       # --------------------------------------------------------------------
+       
+       if lat > 1.2 and action_taken == 2:
+          reward += 0.4   
        # (6) Reward improvement from previous step
        # --------------------------------------------------------------------
        if prev_scores is not None:
@@ -734,21 +709,6 @@ class CAPAPlusController(threading.Thread):
             'latency': score_lat,
             'predictive': predictive_util
         }
-        # ----------------- TRENDS -----------------
-        cpu_trend = 0.0
-        lat_trend = 0.0
-        pod_trend = 0.0
-
-        if self.last_metrics[svc] is not None:
-            prev_metrics = self.last_metrics[svc]['metrics']
-            prev_scores = self.last_metrics[svc]['scores']
-            prev_elapsed = self.last_metrics[svc]['elapsed']
-
-            dt = max(1.0, elapsed - prev_elapsed)
-
-            cpu_trend = (score_cpu - prev_scores['cpu']) / dt
-            lat_trend = (score_lat - prev_scores['latency']) / dt
-            pod_trend = (m['pods'] - prev_metrics['pods']) / dt
         # ----------------- Q-LEARNING -----------------
         agent = self.rl_agents[svc]
         current_state = agent.get_state(
@@ -764,7 +724,7 @@ class CAPAPlusController(threading.Thread):
         # Learn from previous transition
         if (
             self.last_rl_state[svc] is not None and
-            self.last_rl_action[svc] is not None and
+            self.last_executed_action[svc] is not None and
             self.last_metrics[svc] is not None
         ):
             prev_metrics = self.last_metrics[svc]['metrics']
@@ -776,12 +736,12 @@ class CAPAPlusController(threading.Thread):
                 m,
                 prev_scores,
                 current_scores,
-                self.last_rl_action[svc]
+                self.last_executed_action[svc]
             )
 
             agent.learn(
                 self.last_rl_state[svc],
-                self.last_rl_action[svc],
+                self.last_executed_action[svc],
                 reward,
                 current_state
             )
@@ -890,6 +850,15 @@ class CAPAPlusController(threading.Thread):
                 print(f"   [RL] {svc}: DOWN suppressed (stabilization)")
         else:
             action_taken = 'stay'
+         # Map textual action_taken to index 0/1/2 for the RL update
+        if action_taken == 'up':
+            executed_action_idx = 2       # SCALE_UP
+        elif action_taken == 'down':
+            executed_action_idx = 0       # SCALE_DOWN
+        else:
+            executed_action_idx = 1       # NO_CHANGE (includes 'stay' and "suppressed" cases)
+
+        self.last_executed_action[svc] = executed_action_idx
 
         target = max(conf['min'], min(target, conf['max']))
 
