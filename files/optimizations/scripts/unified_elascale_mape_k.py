@@ -106,7 +106,7 @@ SERVICES = list(SERVICE_CONFIGS.keys())
 # Load Pattern (Can be modified for steady state)
 LOAD_STEPS = [
     (50, 60), (100, 60), (500, 60),
-    (1000, 180),  # Peak
+    (1000, 1200),  # Peak
     (500, 60), (100, 60), (50, 60)
 ]
 
@@ -654,13 +654,23 @@ class CAPAPlusController(threading.Thread):
                reward += 0.3
            elif delta_lat < -0.1:
                reward -= 0.3
-
+       # --------------------------------------------------------------------
+        # (7) Efficiency: fewer pods when SLA is excellent
+        # --------------------------------------------------------------------
+        # Define how "overprovisioned" we are:
+        #   eff = 0 when pods == min
+        #   eff → 1 as pods → max
+        if conf["max"] > conf["min"]:
+            eff = (pods - conf["min"]) / float(conf["max"] - conf["min"])
+            eff = max(0.0, min(1.0, eff))
+        else:
+            eff = 0.0
        # --------------------------------------------------------------------
        # (7) Efficiency reward: using fewer pods when SLA is excellent
        # --------------------------------------------------------------------
        if lat < 0.8 and pods > conf["min"]:
            # Reward proportional to unused capacity
-           reward += 0.2 * (1.0 - lat) * (1.0 - ready_ratio)
+           reward += 0.3 * (1.0 - lat) * (1.0 - eff)
 
        return reward
 
