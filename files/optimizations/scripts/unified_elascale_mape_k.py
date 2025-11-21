@@ -105,6 +105,7 @@ SERVICES = list(SERVICE_CONFIGS.keys())
 
 # Load Pattern (Can be modified for steady state)
 LOAD_STEPS = [
+    (0, 60),     # idle & resources warm
     (50, 400),
     (100, 400),
     (300, 400),
@@ -113,6 +114,7 @@ LOAD_STEPS = [
     (100, 300),
     (50, 300),
 ]
+
 
 # ============================================================
 # K8S & PROMETHEUS HELPERS
