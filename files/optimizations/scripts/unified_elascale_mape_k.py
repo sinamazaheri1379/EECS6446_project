@@ -106,7 +106,7 @@ SERVICES = list(SERVICE_CONFIGS.keys())
 # Load Pattern (Can be modified for steady state)
 LOAD_STEPS = [
     (50, 60), (100, 60), (500, 60),
-    (1000, 1200),  # Peak
+    (600, 300),  # Peak
     (500, 60), (100, 60), (50, 60)
 ]
 
