@@ -660,10 +660,10 @@ class CAPAPlusController(threading.Thread):
         # Define how "overprovisioned" we are:
         #   eff = 0 when pods == min
         #   eff → 1 as pods → max
-        if conf["max"] > conf["min"]:
+       if conf["max"] > conf["min"]:
             eff = (pods - conf["min"]) / float(conf["max"] - conf["min"])
             eff = max(0.0, min(1.0, eff))
-        else:
+       else:
             eff = 0.0
        # --------------------------------------------------------------------
        # (7) Efficiency reward: using fewer pods when SLA is excellent
