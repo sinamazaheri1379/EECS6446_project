@@ -650,249 +650,253 @@ class CAPAPlusController(threading.Thread):
        return reward
 
     def _process_service(self, svc, current_time, elapsed, current_users):
-        """
-        MAPE-K Loop with active Q-Learning.
+       """
+       MAPE-K Loop with active Q-Learning.
 
-        1. Monitor metrics
-        2. Learn from previous action
-        3. Choose new action
-        4. Apply safety checks and scale
-        """
-        # ----------------- MONITOR -----------------
-        m = get_metrics(svc)
-        if m['pods'] == 0:
-            return
+       1. Monitor metrics
+       2. Learn from previous action (using EXECUTED action)
+       3. Choose new action
+       4. Apply safety checks and scale
+       """
+       # ----------------- MONITOR -----------------
+       m = get_metrics(svc)
+       if m['pods'] == 0:
+           return
 
-        conf = SERVICE_CONFIGS[svc]
+       conf = SERVICE_CONFIGS[svc]
 
-        active_capacity = max(1, m['ready_pods'])
+       active_capacity = max(1, m['ready_pods'])
 
-        # CPU util (0-1+)
-        cpu_limit = conf['cpu_limit_millicores']
-        score_cpu = m['cpu'] / (active_capacity * cpu_limit) if cpu_limit > 0 else 0
+       # CPU util (0-1+)
+       cpu_limit = conf['cpu_limit_millicores']
+       score_cpu = m['cpu'] / (active_capacity * cpu_limit) if cpu_limit > 0 else 0.0
 
-        # Memory util (0-1+)
-        mem_limit = conf.get('mem_limit_bytes', 128 * 1024 * 1024)
-        score_mem = m['mem'] / (active_capacity * mem_limit) if mem_limit > 0 else 0
+       # Memory util (0-1+)
+       mem_limit = conf.get('mem_limit_bytes', 128 * 1024 * 1024)
+       score_mem = m['mem'] / (active_capacity * mem_limit) if mem_limit > 0 else 0.0
 
-        # Latency score
-        lat_target = conf.get('latency_target_seconds', 0.2)
-        score_lat = m['latency'] / lat_target if lat_target > 0 else 0
+       # Latency score (ratio vs target)
+       lat_target = conf.get('latency_target_seconds', 0.2)
+       score_lat = m['latency'] / lat_target if lat_target > 0 else 0.0
 
-        # Pod ratio
-        pod_ratio = m['pods'] / conf['max'] if conf['max'] > 0 else 0
+       # Pod ratio
+       pod_ratio = m['pods'] / conf['max'] if conf['max'] > 0 else 0.0
 
-        # Clamp to sane ranges
-        score_cpu = float(max(0.0, min(score_cpu, 2.0)))
-        score_lat = float(max(0.0, min(score_lat, 5.0)))
-        score_mem = float(max(0.0, min(score_mem, 2.0)))
-        pod_ratio = float(max(0.0, min(pod_ratio, 1.0)))
+       # Clamp to sane ranges
+       score_cpu = float(max(0.0, min(score_cpu, 2.0)))
+       score_lat = float(max(0.0, min(score_lat, 5.0)))
+       score_mem = float(max(0.0, min(score_mem, 2.0)))
+       pod_ratio = float(max(0.0, min(pod_ratio, 1.0)))
 
-        # Predictive (unchanged, optional)
-        predictive_util = 0.0
-        if svc in self.models and current_users > 0:
-            try:
-                future_time = elapsed + 60
-                input_df = pd.DataFrame(
-                    [[current_users, future_time]],
-                    columns=['scenario_users', 'elapsed_total_seconds']
-                )
-                predicted_cpu = self.models[svc].predict(input_df)[0]
-                total_capacity = m['pods'] * cpu_limit
-                predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0
-            except Exception:
-                predictive_util = 0.0
+       # Predictive (unchanged, optional)
+       predictive_util = 0.0
+       if svc in self.models and current_users > 0:
+           try:
+               future_time = elapsed + 60
+               input_df = pd.DataFrame(
+                   [[current_users, future_time]],
+                   columns=['scenario_users', 'elapsed_total_seconds']
+               )
+               predicted_cpu = self.models[svc].predict(input_df)[0]
+               total_capacity = m['pods'] * cpu_limit
+               predictive_util = predicted_cpu / total_capacity if total_capacity > 0 else 0.0
+           except Exception:
+               predictive_util = 0.0
 
-        current_scores = {
-            'cpu': score_cpu,
-            'memory': score_mem,
-            'latency': score_lat,
-            'predictive': predictive_util
-        }
-        # ----------------- Q-LEARNING -----------------
-        agent = self.rl_agents[svc]
-        current_state = agent.get_state(
-            cpu_util=score_cpu,
-            latency_score=score_lat,
-            pod_ratio=pod_ratio,
-            mem_util=score_mem,
-            cpu_trend=cpu_trend,
-            lat_trend=lat_trend,
-            pod_trend=pod_trend
-        )
+       current_scores = {
+           'cpu': score_cpu,
+           'memory': score_mem,
+           'latency': score_lat,
+           'predictive': predictive_util,
+       }
 
-        # Learn from previous transition
-        if (
-            self.last_rl_state[svc] is not None and
-            self.last_executed_action[svc] is not None and
-            self.last_metrics[svc] is not None
-        ):
-            prev_metrics = self.last_metrics[svc]['metrics']
-            prev_scores = self.last_metrics[svc]['scores']
+       agent = self.rl_agents[svc]
 
-            reward = self._calculate_reward(
-                svc,
-                prev_metrics,
-                m,
-                prev_scores,
-                current_scores,
-                self.last_executed_action[svc]
-            )
+       # ----------------- BUILD CURRENT STATE -----------------
+       # (Assuming get_state now ignores trends or takes them as kwargs)
+       current_state = agent.get_state(
+           cpu_util=score_cpu,
+           latency_score=score_lat,
+           pod_ratio=pod_ratio,
+           mem_util=score_mem,
+       )
 
-            agent.learn(
-                self.last_rl_state[svc],
-                self.last_executed_action[svc],
-                reward,
-                current_state
-            )
+       # ----------------- LEARN FROM PREVIOUS TRANSITION -----------------
+       if (
+           self.last_rl_state[svc] is not None and
+           self.last_executed_action[svc] is not None and
+           self.last_metrics[svc] is not None
+       ):
+           prev_metrics = self.last_metrics[svc]['metrics']
+           prev_scores = self.last_metrics[svc]['scores']
+           prev_action_idx = self.last_executed_action[svc]  # 0/1/2
 
-            self.rl_metrics[svc].append({
-                'timestamp': current_time,
-                'elapsed': elapsed,
-                'users': current_users,
-                'state': self.last_rl_state[svc],
-                'action': self.last_rl_action[svc],
-                'reward': reward,
-                'cpu_util': score_cpu,
-                'lat_score': score_lat,
-                'pod_ratio': pod_ratio,
-                'pods': m['pods'],
-                'ready_pods': m['ready_pods'],
-                'epsilon': agent.epsilon,
-                'q_values': agent.q_table.get(
-                    self.last_rl_state[svc],
-                    [0, 0, 0]
-                ).copy()
-            })
+           reward = self._calculate_reward(
+               svc,
+               prev_metrics,
+               m,
+               prev_scores,
+               current_scores,
+               prev_action_idx
+           )
 
-            agent.decay_epsilon()
+           agent.learn(
+               self.last_rl_state[svc],
+               prev_action_idx,
+               reward,
+               current_state
+           )
 
-            act_names = ["DOWN", "STAY", "UP"]
-            print(
-                f"   [RL-Learn] {svc}: Reward={reward:+.2f} "
-                f"for {act_names[self.last_rl_action[svc]]}, "
-                f"ε={agent.epsilon:.3f}"
-            )
+           self.rl_metrics[svc].append({
+               'timestamp': current_time,
+               'elapsed': elapsed,
+               'users': current_users,
+               'state': self.last_rl_state[svc],
+               'action': prev_action_idx,   # executed action
+               'reward': reward,
+               'cpu_util': score_cpu,
+               'lat_score': score_lat,
+               'pod_ratio': pod_ratio,
+               'pods': m['pods'],
+               'ready_pods': m['ready_pods'],
+               'epsilon': agent.epsilon,
+               'q_values': agent.q_table.get(
+                   self.last_rl_state[svc],
+                   [0.0, 0.0, 0.0]
+               ).copy()
+           })
 
-        # Choose new action
-        rl_action = agent.choose_action(current_state)
+           agent.decay_epsilon()
 
-        # Save for next iteration
-        self.last_rl_state[svc] = current_state
-        self.last_rl_action[svc] = rl_action
-        self.last_metrics[svc] = {
-            'metrics': m.copy(),
-            'scores': current_scores.copy(),
-            'elapsed': elapsed
-        }
+           act_names = ["DOWN", "STAY", "UP"]
+           print(
+               f"   [RL-Learn] {svc}: Reward={reward:+.2f} "
+               f"for {act_names[prev_action_idx]}, "
+               f"ε={agent.epsilon:.3f}"
+           )
 
+       # ----------------- CHOOSE NEW ACTION -----------------
+       rl_action = agent.choose_action(current_state)  # 0/1/2
+       action_names = ["SCALE_DOWN", "NO_CHANGE", "SCALE_UP"]
 
-        # ----------------- PLAN (SAFETY) -----------------
-        if svc not in self.last_scale_time:
-            self.last_scale_time[svc] = 0
-            self.last_scale_action[svc] = 'none'
+       # ----------------- PLAN (SAFETY) -----------------
+       if svc not in self.last_scale_time:
+           self.last_scale_time[svc] = 0
+           self.last_scale_action[svc] = 'none'
 
-        safety_override = False
-        original_action = rl_action
+       safety_override = False
+       original_action = rl_action
 
-        # Safety: critical latency
-        if score_lat > 2.0 and rl_action != 2:
-            print(
-                f"   ⚠️ SAFETY: Critical latency ({score_lat:.1f}x target), "
-                f"forcing SCALE_UP"
-            )
-            rl_action = 2
-            safety_override = True
+       # Safety: critical latency - enforce SCALE_UP if not already
+       if score_lat > 2.0 and rl_action != 2:
+           print(
+               f"   ⚠️ SAFETY: Critical latency ({score_lat:.1f}x target), "
+               f"forcing SCALE_UP"
+           )
+           rl_action = 2
+           safety_override = True
 
-        # Safety: not enough ready pods to safely scale up
-        ready_ratio = m['ready_pods'] / max(1, m['pods'])
-        if rl_action == 2 and ready_ratio < 0.4 and score_lat < 3.0:
-            # If we are already in extreme latency (>3x), allow UP even with low readiness.
-            print(
-                f"   ⚠️ SAFETY: Only {m['ready_pods']}/{m['pods']} pods ready "
-                f"and latency not extreme, forcing NO_CHANGE"
-            )
-            rl_action = 1
-            safety_override = True
-        # Safety: boundaries
-        if m['pods'] >= conf['max'] and rl_action == 2:
-            rl_action = 1
-            safety_override = True
-        elif m['pods'] <= conf['min'] and rl_action == 0:
-            rl_action = 1
-            safety_override = True
+       # Safety: not enough ready pods to safely scale up (unless extreme latency)
+       ready_ratio = m['ready_pods'] / max(1, m['pods'])
+       if rl_action == 2 and ready_ratio < 0.4 and score_lat < 3.0:
+           print(
+               f"   ⚠️ SAFETY: Only {m['ready_pods']}/{m['pods']} pods ready "
+               f"and latency not extreme, forcing NO_CHANGE"
+           )
+           rl_action = 1
+           safety_override = True
 
-        # ----------------- EXECUTE -----------------
-        target = m['pods']
-        action_taken = 'none'
-        action_names = ["SCALE_DOWN", "NO_CHANGE", "SCALE_UP"]
+       # Safety: boundaries
+       if m['pods'] >= conf['max'] and rl_action == 2:
+           rl_action = 1
+           safety_override = True
+       elif m['pods'] <= conf['min'] and rl_action == 0:
+           rl_action = 1
+           safety_override = True
 
-        if rl_action == 2:  # SCALE UP
-            if (
-                self.last_scale_action[svc] == 'down' and
-                (current_time - self.last_scale_time[svc]) < 60
-            ):
-                print(f"   [RL] {svc}: UP suppressed (anti-oscillation)")
-            else:
-                target += conf['scale_up_increment']
-                action_taken = 'up'
-                self.last_scale_time[svc] = current_time
-                self.last_scale_action[svc] = 'up'
+       # ----------------- EXECUTE -----------------
+       target = m['pods']
+       action_taken = 'none'   # 'up' / 'down' / 'stay'
 
-        elif rl_action == 0:  # SCALE DOWN
-            stabilization = 300 if self.last_scale_action[svc] != 'up' else 600
-            if current_time - self.last_scale_time[svc] > stabilization:
-                target -= conf['scale_down_increment']
-                action_taken = 'down'
-                self.last_scale_time[svc] = current_time
-                self.last_scale_action[svc] = 'down'
-            else:
-                print(f"   [RL] {svc}: DOWN suppressed (stabilization)")
-        else:
-            action_taken = 'stay'
-         # Map textual action_taken to index 0/1/2 for the RL update
-        if action_taken == 'up':
-            executed_action_idx = 2       # SCALE_UP
-        elif action_taken == 'down':
-            executed_action_idx = 0       # SCALE_DOWN
-        else:
-            executed_action_idx = 1       # NO_CHANGE (includes 'stay' and "suppressed" cases)
+       if rl_action == 2:  # SCALE UP
+           if (
+               self.last_scale_action[svc] == 'down' and
+               (current_time - self.last_scale_time[svc]) < 60
+           ):
+               print(f"   [RL] {svc}: UP suppressed (anti-oscillation)")
+               action_taken = 'stay'
+           else:
+               target += conf['scale_up_increment']
+               action_taken = 'up'
+               self.last_scale_time[svc] = current_time
+               self.last_scale_action[svc] = 'up'
 
-        self.last_executed_action[svc] = executed_action_idx
+       elif rl_action == 0:  # SCALE DOWN
+           stabilization = 300 if self.last_scale_action[svc] != 'up' else 600
+           if current_time - self.last_scale_time[svc] > stabilization:
+               target -= conf['scale_down_increment']
+               action_taken = 'down'
+               self.last_scale_time[svc] = current_time
+               self.last_scale_action[svc] = 'down'
+           else:
+               print(f"   [RL] {svc}: DOWN suppressed (stabilization)")
+               action_taken = 'stay'
+       else:
+           action_taken = 'stay'
 
-        target = max(conf['min'], min(target, conf['max']))
+       # ---- Map textual action_taken to index 0/1/2 for the RL update ----
+       if action_taken == 'up':
+           executed_action_idx = 2       # SCALE_UP
+       elif action_taken == 'down':
+           executed_action_idx = 0       # SCALE_DOWN
+       else:
+           executed_action_idx = 1       # NO_CHANGE ('stay' or suppressed)
 
-        if target != m['pods'] and action_taken != 'stay':
-            q_vals = agent.q_table.get(current_state, [0, 0, 0])
-            override_str = (
-                f" [SAFETY from {action_names[original_action]}]"
-                if safety_override else ""
-            )
+       self.last_executed_action[svc] = executed_action_idx
 
-            print(
-                f"   [RL-Active]{override_str} {svc}: {action_names[rl_action]} "
-                f"{m['pods']}→{target} pods"
-            )
-            print(
-                f"      State: CPU={score_cpu:.2f}, "
-                f"Lat={score_lat:.2f}x, Pods={pod_ratio:.2f}"
-            )
-            print(
-                "      Q-values: "
-                f"[{q_vals[0]:.3f}, {q_vals[1]:.3f}, {q_vals[2]:.3f}]"
-            )
+       target = max(conf['min'], min(target, conf['max']))
 
-            if predictive_util > 0:
-                print(f"      Predictive: {predictive_util:.2f} (60s forecast)")
+       if target != m['pods'] and action_taken != 'stay':
+           q_vals = agent.q_table.get(current_state, [0.0, 0.0, 0.0])
+           override_str = (
+               f" [SAFETY from {action_names[original_action]}]"
+               if safety_override else ""
+           )
 
-            scale_deployment(svc, target)
+           print(
+               f"   [RL-Active]{override_str} {svc}: {action_names[rl_action]} "
+               f"{m['pods']}→{target} pods"
+           )
+           print(
+               f"      State: CPU={score_cpu:.2f}, "
+               f"Lat={score_lat:.2f}x, Pods={pod_ratio:.2f}"
+           )
+           print(
+               "      Q-values: "
+               f"[{q_vals[0]:.3f}, {q_vals[1]:.3f}, {q_vals[2]:.3f}]"
+           )
 
-        elif action_taken == 'stay':
-            if elapsed % 60 < 15:
-                print(
-                    f"   [RL-Active] {svc}: NO_CHANGE "
-                    f"(State: CPU={score_cpu:.2f}, Lat={score_lat:.2f}x)"
-                )
+           if predictive_util > 0:
+               print(f"      Predictive: {predictive_util:.2f} (60s forecast)")
+
+           scale_deployment(svc, target)
+
+       elif action_taken == 'stay':
+           if elapsed % 60 < 15:
+               print(
+                   f"   [RL-Active] {svc}: NO_CHANGE "
+                   f"(State: CPU={score_cpu:.2f}, Lat={score_lat:.2f}x)"
+               )
+
+       # ----------------- SAVE STATE FOR NEXT ITERATION -----------------
+       self.last_rl_state[svc] = current_state
+       self.last_rl_action[svc] = rl_action
+       self.last_metrics[svc] = {
+           'metrics': m.copy(),
+           'scores': current_scores.copy(),
+           'elapsed': elapsed
+       }
+
 
     def stop(self):
         """Stop controller and save RL data."""
