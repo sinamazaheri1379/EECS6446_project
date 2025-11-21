@@ -394,24 +394,35 @@ class QLearningAgent:
         return q_values
 
     def choose_action(self, state, force_exploit=False):
-        # Initialize new state
-        if state not in self.q_table:
-            self.q_table[state] = self._init_q_values(state)
+       # Initialize new state
+       if state not in self.q_table:
+           self.q_table[state] = self._init_q_values(state)
 
-        self.state_visits[state] += 1
-        self.total_steps += 1
+       self.state_visits[state] += 1
+       self.total_steps += 1
 
-        if not force_exploit and np.random.random() < self.epsilon:
-            # exploration, small bias towards NO_CHANGE
-            return np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
+       # Pure exploitation (used by get_best_action, if needed)
+       if force_exploit:
+           q_values = self.q_table[state]
+           max_q = max(q_values)
+           best_actions = [i for i, q in enumerate(q_values) if abs(q - max_q) < 1e-6]
+           return np.random.choice(best_actions)
 
-        q_values = self.q_table[state]
-        bonus = 0.1 / np.sqrt(self.state_visits[state])
-        adjusted = [q + bonus for q in q_values]
+       # Epsilon-greedy exploration
+       if np.random.random() < self.epsilon:
+           # slight bias to NO_CHANGE
+           return np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
 
-        max_q = max(adjusted)
-        best_actions = [i for i, q in enumerate(adjusted) if abs(q - max_q) < 1e-6]
-        return np.random.choice(best_actions)
+       # UCB1-like bonus on top of exploitation
+       q_values = self.q_table[state]
+       visits = self.state_visits[state]
+       # c controls exploration strength
+       c = 0.5
+       bonus = c * np.sqrt(np.log(self.total_steps + 1) / (visits + 1))
+       adjusted = [q + bonus for q in q_values]
+       max_q = max(adjusted)
+       best_actions = [i for i, q in enumerate(adjusted) if abs(q - max_q) < 1e-6]
+       return np.random.choice(best_actions)
 
     def learn(self, state, action, reward, next_state):
         if state not in self.q_table:
@@ -555,74 +566,103 @@ class CAPAPlusController(threading.Thread):
                 time.sleep(1)
 
     def _calculate_reward(self, svc, prev_m, curr_m, prev_scores, curr_scores, action_taken):
-        """
-        Reward design (higher is better):
+       """
+       Improved, numerically-stable reward function for Kubernetes RL autoscaling.
 
-        + SLA adherence (latency near or below target)
-        + CPU in [40%, 70%]
-        + Fewer pods when SLA is OK
-        + High ready/desired ratio
-        + Improvement in latency vs previous step
+       Goals:
+         + Reward SLA adherence
+         + Reward efficiency (fewer pods when SLA excellent)
+         + Reward stable CPU in target zone
+         + Reward readiness (only when SLA good)
+         + Reward improvement relative to previous step
 
-        - Large SLA violations
-        - Very low or very high CPU
-        - Memory pressure
-        - Frequent scaling actions during instability
-        """
+         - Penalize SLA violations
+         - Penalize over/under CPU usage
+         - Penalize memory pressure
+         - Penalize scaling in unstable readiness conditions
+         - Penalize unnecessary scaling
+       """
 
-        conf = SERVICE_CONFIGS[svc]
-        lat = curr_scores["latency"]        # ratio vs target
-        cpu = curr_scores["cpu"]
-        mem = curr_scores["memory"]
+       conf = SERVICE_CONFIGS[svc]
+       lat = curr_scores["latency"]     # ratio vs target (0.0–5.0 typically)
+       cpu = curr_scores["cpu"]         # 0.0–2.0 range
+       mem = curr_scores["memory"]      # 0.0–2.0 range
 
-        pods = curr_m["pods"]
-        ready = curr_m["ready_pods"]
-        ready_ratio = ready / max(1, pods)
+       pods = curr_m["pods"]
+       ready = curr_m["ready_pods"]
+       ready_ratio = ready / max(1, pods)
 
-        reward = 0.0
+       reward = 0.0
 
-        # 1) SLA (latency)
-        if lat <= 1.0:
-            reward += 0.6 * (1.0 - lat)      # better if well below target
-        else:
-            reward -= 1.2 * (lat - 1.0)      # strong penalty above target
+       # --------------------------------------------------------------------
+       # (1) SLA / Latency reward (normalized)
+       # --------------------------------------------------------------------
+       # Map:
+       #   lat <= 1.0 → positive reward up to +0.6
+       #   lat > 1.0 → negative up to -1.0
+       if lat <= 1.0:
+           reward += 0.6 * (1.0 - lat)          # better when much below target
+       else:
+           reward -= min(1.0, (lat - 1.0))       # strong penalty for violation
 
-        # 2) CPU efficiency
-        if 0.4 <= cpu <= 0.7:
-            reward += 0.4
-        elif cpu < 0.2:
-            reward -= 0.3
-        elif cpu > 0.9:
-            reward -= 0.4
+       # --------------------------------------------------------------------
+       # (2) CPU efficiency reward
+       # Target zone = [40%, 70%]
+       # --------------------------------------------------------------------
+       if 0.4 <= cpu <= 0.7:
+           reward += 0.4
+       else:
+           # Penalize under/over utilization smoothly
+           reward -= 0.3 * abs(cpu - 0.55)
 
-        # 3) Memory pressure
-        if mem > 0.9:
-            reward -= 0.5
-        elif mem > 0.75:
-            reward -= 0.2
+       # --------------------------------------------------------------------
+       # (3) Memory pressure
+       # --------------------------------------------------------------------
+       if mem > 0.9:
+           reward -= 0.6
+       elif mem > 0.75:
+           reward -= 0.3
 
-        # 4) Ready pods vs ordered (warmup)
-        reward += 0.4 * ready_ratio
-        if ready_ratio < 0.5 and action_taken == 2:
-            # scaled up but still most pods not ready → slight penalty
-            reward -= 0.3
+       # --------------------------------------------------------------------
+       # (4) Readiness reward (only helps when latency is good)
+       # --------------------------------------------------------------------
+       if lat < 1.0:
+           reward += 0.4 * ready_ratio
+       else:
+           reward -= 0.2 * (1 - ready_ratio)
 
-        # 5) Stability / scaling cost
-        if action_taken == 2:       # SCALE_UP
-            reward -= 0.1
-        elif action_taken == 0:     # SCALE_DOWN
-            reward -= 0.05
+       # Scale-up during unready period = very bad
+       if ready_ratio < 0.5 and action_taken == 2:
+           reward -= 0.4
 
-        # 6) Improvement vs previous latency
-        if prev_scores is not None:
-            prev_lat = prev_scores["latency"]
-            delta_lat = prev_lat - lat
-            if delta_lat > 0.1:     # noticeable improvement
-                reward += 0.3
-            elif delta_lat < -0.1:  # noticeable regression
-                reward -= 0.3
+       # --------------------------------------------------------------------
+       # (5) Penalize unnecessary scaling (larger penalty)
+       # --------------------------------------------------------------------
+       if action_taken == 2:     # SCALE UP
+           reward -= 0.2
+       elif action_taken == 0:   # SCALE DOWN
+           reward -= 0.1
 
-        return reward
+       # --------------------------------------------------------------------
+       # (6) Reward improvement from previous step
+       # --------------------------------------------------------------------
+       if prev_scores is not None:
+           prev_lat = prev_scores["latency"]
+           delta_lat = prev_lat - lat
+
+           if delta_lat > 0.1:
+               reward += 0.3
+           elif delta_lat < -0.1:
+               reward -= 0.3
+
+       # --------------------------------------------------------------------
+       # (7) Efficiency reward: using fewer pods when SLA is excellent
+       # --------------------------------------------------------------------
+       if lat < 0.8 and pods > conf["min"]:
+           # Reward proportional to unused capacity
+           reward += 0.2 * (1.0 - lat) * (1.0 - ready_ratio)
+
+       return reward
 
     def _process_service(self, svc, current_time, elapsed, current_users):
         """
