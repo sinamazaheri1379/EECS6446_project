@@ -105,9 +105,13 @@ SERVICES = list(SERVICE_CONFIGS.keys())
 
 # Load Pattern (Can be modified for steady state)
 LOAD_STEPS = [
-    (50, 60), (100, 60), (500, 60),
-    (600, 600),  # Peak
-    (500, 60), (100, 60), (50, 60)
+    (50, 400),
+    (100, 400),
+    (300, 400),
+    (500, 600),
+    (300, 300),
+    (100, 300),
+    (50, 300),
 ]
 
 # ============================================================
@@ -629,6 +633,17 @@ class CAPAPlusController(threading.Thread):
                reward += 0.3
            elif delta_lat < -0.1:
                reward -= 0.3
+       if prev_m is not None:
+          try:
+              prev_lat_raw = prev_m["latency"]
+              curr_lat_raw = curr_m["latency"]
+
+              if prev_lat_raw - curr_lat_raw > 0.02:
+                  reward += 0.5
+              elif curr_lat_raw - prev_lat_raw > 0.02:
+                  reward -= 0.5
+          except:
+              pass
        # --------------------------------------------------------------------
         # (7) Efficiency: fewer pods when SLA is excellent
         # --------------------------------------------------------------------
