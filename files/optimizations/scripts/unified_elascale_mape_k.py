@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-Unified CAPA+ (Elascale) MAPE-K Controller with Anti-Overfitting Measures
+Unified CAPA+ Experiment Framework for Kubernetes Autoscaling
+==============================================================
 
-This implementation incorporates academic best practices from:
-- Jain (1991): The Art of Computer Systems Performance Analysis
-- Harchol-Balter (2013): Performance Modeling and Design of Computer Systems
-- INTROD_1: Introduction to Computer System Performance Evaluation
-
-Key Features:
-- Shadow Mode / Hybrid Mode / Active Mode for safe RL training
-- Reduced state space (8 states) to prevent overfitting
-- Double Q-Learning to reduce overestimation bias
-- Prioritized Experience Replay for diverse learning
-- Exponential averaging for metric smoothing (INTROD_1 Eq. 5.3)
-- Multiple load patterns with train/test split
-- Proper reward function following Jain's Rule 1
+Patched version (Dec 2025):
+- SHADOW mode: learning disabled to avoid off-policy / causal mismatch
+- Reward settling window after scaling: update only after pods settle (ready ~= desired) or timeout
+- CLI: hybrid mode maps to TrainingPhase.HYBRID_50 (previously incorrect)
+- Safe state serialization (no eval)
 
 Author: EECS6446 Cloud Computing Project
-Date: November 2025
+Date: December 2025
 """
 
 import os
@@ -28,1621 +21,1488 @@ import signal
 import logging
 import argparse
 import subprocess
+import math
+import random
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field, asdict
-from collections import defaultdict
+from collections import deque, defaultdict
 from enum import Enum
-import threading
+from pathlib import Path
 
 import numpy as np
 
+try:
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
+    import requests
+
+
 # =============================================================================
-# CONFIGURATION
+# SECTION 1: CONFIGURATION AND CONSTANTS
 # =============================================================================
 
-# Service configurations for Online Boutique
-SERVICE_CONFIGS = {
-    'frontend': {
-        'min': 1, 'max': 10,
-        'target_cpu': 50, 'target_latency_ms': 200,
-        'scale_up_threshold': 70, 'scale_down_threshold': 30
-    },
-    'recommendationservice': {
-        'min': 1, 'max': 5,
-        'target_cpu': 50, 'target_latency_ms': 100,
-        'scale_up_threshold': 70, 'scale_down_threshold': 30
-    },
-    'productcatalogservice': {
-        'min': 1, 'max': 5,
-        'target_cpu': 50, 'target_latency_ms': 100,
-        'scale_up_threshold': 70, 'scale_down_threshold': 30
-    },
-    'cartservice': {
-        'min': 1, 'max': 5,
-        'target_cpu': 50, 'target_latency_ms': 100,
-        'scale_up_threshold': 70, 'scale_down_threshold': 30
-    },
-    'checkoutservice': {
-        'min': 1, 'max': 5,
-        'target_cpu': 50, 'target_latency_ms': 150,
-        'scale_up_threshold': 70, 'scale_down_threshold': 30
-    },
-}
+@dataclass
+class ServiceConfig:
+    min_replicas: int = 1
+    max_replicas: int = 10
+    target_cpu_percent: int = 50
+    target_latency_ms: float = 200.0
+    capacity_per_pod: float = 100.0  # μ: requests/second one pod can handle
 
-# Load patterns for training and testing (Jain Ch. 11 - avoid ratio games)
+
+@dataclass
+class Config:
+    prometheus_url: str = "http://localhost:9090"
+    locust_url: str = "http://localhost:8089"
+    namespace: str = "default"
+
+    services: Dict[str, ServiceConfig] = field(default_factory=lambda: {
+        'frontend': ServiceConfig(1, 10, 50, 200, 100),
+        'recommendationservice': ServiceConfig(1, 5, 50, 100, 150),
+        'productcatalogservice': ServiceConfig(1, 5, 50, 100, 200),
+        'cartservice': ServiceConfig(1, 5, 50, 100, 100),
+        'checkoutservice': ServiceConfig(1, 5, 50, 150, 80),
+    })
+
+    train_patterns: List[str] = field(default_factory=lambda: ['step', 'gradual', 'sine'])
+    test_patterns: List[str] = field(default_factory=lambda: ['spike', 'random'])
+
+    learning_rate: float = 0.1
+    discount_factor: float = 0.95
+    epsilon_start: float = 1.0
+    epsilon_min: float = 0.10
+    epsilon_decay: float = 0.9995
+
+    stability_threshold: float = 0.9
+    target_utilization: float = 0.7
+    little_law_error_threshold: float = 0.2
+
+    smoothing_alpha: float = 0.3
+
+    control_interval_sec: float = 15.0
+    cooldown_sec: float = 60.0
+
+    # NEW: settling window after scaling (seconds)
+    scaling_settle_timeout_sec: float = 180.0
+    # NEW: readiness tolerance (ready >= desired - tol)
+    readiness_tolerance: int = 0
+
+
+CONFIG = Config()
+
 LOAD_PATTERNS = {
-    # Training patterns (75%)
-    'step': [50, 100, 300, 500, 600, 500, 300, 100],      # Original pattern
-    'gradual': [50, 150, 250, 350, 450, 550, 450, 250],   # Linear ramp
-    'sine': [300, 477, 550, 477, 300, 123, 50, 123],      # Sinusoidal
-    
-    # Testing patterns (25%) - NEVER train on these
-    'spike': [50, 50, 800, 100, 50, 700, 50, 50],         # Sudden spikes
-    'random': None,  # Generated at runtime
+    'warmup': [50, 100, 150, 100, 50],
+    'step': [50, 100, 300, 500, 600, 500, 300, 100],
+    'gradual': [50, 150, 250, 350, 450, 550, 450, 250],
+    'sine': [300, 477, 550, 477, 300, 123, 50, 123],
+    'spike': [50, 50, 800, 100, 50, 700, 50, 50],
+    'stress': [100, 300, 600, 800, 600, 300, 100, 50],
+    'random': None,
 }
 
-TRAIN_PATTERNS = ['step', 'gradual', 'sine']
-TEST_PATTERNS = ['spike', 'random']
-
-# Prometheus endpoint
-PROMETHEUS_URL = os.environ.get('PROMETHEUS_URL', 'http://localhost:9090')
-
-# Logging configuration
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    handlers=[logging.StreamHandler(), logging.FileHandler('capa_experiment.log')]
+)
 logger = logging.getLogger('CAPA+')
 
 
 # =============================================================================
-# ENUMS AND DATA CLASSES
+# SECTION 2: ENUMS AND DATA CLASSES
 # =============================================================================
 
 class ControlMode(Enum):
-    """Controller operating modes"""
-    SHADOW = "shadow"       # RL observes, baseline controls
-    HYBRID = "hybrid"       # Probabilistic mix
-    ACTIVE = "active"       # RL controls
+    SHADOW = "shadow"
+    HYBRID = "hybrid"
+    ACTIVE = "active"
+    EVALUATION = "eval"
 
 
 class ScalingAction(Enum):
-    """Possible scaling actions"""
     SCALE_DOWN = 0
     STAY = 1
     SCALE_UP = 2
 
 
+class TrainingPhase(Enum):
+    NOT_STARTED = "not_started"
+    SHADOW = "shadow"
+    HYBRID_25 = "hybrid_25"
+    HYBRID_50 = "hybrid_50"
+    HYBRID_75 = "hybrid_75"
+    ACTIVE = "active"
+    EVALUATION = "evaluation"
+    COMPLETED = "completed"
+
+
 @dataclass
 class ServiceMetrics:
-    """Metrics for a single service at a point in time"""
-    timestamp: float
-    service: str
-    cpu_util: float
-    memory_util: float
-    latency_p50_ms: float
-    latency_p95_ms: float
-    latency_p99_ms: float
-    request_rate: float
-    error_rate: float
-    pods_desired: int
-    pods_ready: int
-    pods_available: int
+    timestamp: float = 0.0
+    service_name: str = ""
+
+    latency_p50_ms: float = 0.0
+    latency_p95_ms: float = 0.0
+    latency_p99_ms: float = 0.0
+    latency_avg_ms: float = 0.0
+    latency_max_ms: float = 0.0
+
+    arrival_rate: float = 0.0
+    total_requests: int = 0
+    failed_requests: int = 0
+    failure_rate: float = 0.0
+
+    cpu_utilization: float = 0.0
+    memory_utilization: float = 0.0
+    memory_bytes: int = 0
+
+    current_replicas: int = 0
+    ready_replicas: int = 0
+    desired_replicas: int = 0
+
+    latency_source: str = "unknown"
+    resource_source: str = "unknown"
+
+
+@dataclass
+class SystemState:
+    timestamp: float = 0.0
+    arrival_rate: float = 0.0
+    response_time_avg_sec: float = 0.0
+    predicted_queue_length: float = 0.0  # projection: lambda * T
+
+    num_servers: int = 0
+    service_rate_per_server: float = 0.0
+    utilization: float = 0.0
+    is_stable: bool = False
+
+    # If you later add measured N, compute error; otherwise keep 0.
+    little_law_error: float = 0.0
+    in_steady_state: bool = False
 
 
 @dataclass
 class ScalingDecision:
-    """Record of a scaling decision"""
     timestamp: float
     service: str
-    state: Tuple
-    rl_action: int
-    baseline_action: int
-    actual_action: int
-    decision_source: str  # 'rl', 'baseline', 'hybrid'
-    metrics_before: Dict
-    reward: Optional[float] = None
+    state: Tuple[int, int, int]
+
+    rl_action: ScalingAction
+    baseline_action: ScalingAction
+    actual_action: ScalingAction
+    decision_source: str
+
+    metrics_snapshot: Dict
+    system_state: Dict
+
+    reward: float = 0.0
+    latency_after_ms: float = 0.0
 
 
 @dataclass
-class ExperimentResult:
-    """Results from a single experiment run"""
-    pattern_name: str
-    mode: str
-    start_time: float
-    end_time: float
-    metrics_history: List[Dict] = field(default_factory=list)
-    decisions_history: List[Dict] = field(default_factory=list)
-    
-    # Summary statistics
-    avg_latency_ms: float = 0.0
-    p95_latency_ms: float = 0.0
-    p99_latency_ms: float = 0.0
-    avg_cpu_util: float = 0.0
-    avg_pods: float = 0.0
-    total_scaling_actions: int = 0
-    sla_violations: int = 0
-    fault_rate: float = 0.0
+class TrainingState:
+    phase: TrainingPhase = TrainingPhase.NOT_STARTED
+    epoch: int = 0
+    total_iterations: int = 0
+    current_pattern: str = ""
+    rl_authority: float = 0.0
+    start_time: float = 0.0
+    last_checkpoint_time: float = 0.0
 
 
 # =============================================================================
-# METRIC SMOOTHER (INTROD_1 Section 2.5.1)
+# SECTION 3: METRICS COLLECTION
 # =============================================================================
 
-class MetricSmoother:
-    """
-    Exponential averaging for metric smoothing
-    
-    From INTROD_1 Section 2.5.1, Equation 5.3:
-    PI(k) = α × PI(k-1) + (1-α) × R(k)
-    
-    Higher α = more weight on past (smoother, slower response)
-    Typical α = 0.3 for responsive smoothing
-    """
-    
-    def __init__(self, alpha: float = 0.3):
-        self.alpha = alpha
-        self.values: Dict[str, float] = {}
-        self.trends: Dict[str, float] = {}
-    
-    def update(self, key: str, raw_value: float) -> Tuple[float, float]:
-        """
-        Update smoothed value and compute trend
-        
-        Returns:
-            (smoothed_value, trend)
-        """
-        if key not in self.values:
-            self.values[key] = raw_value
-            self.trends[key] = 0.0
-        else:
-            old_val = self.values[key]
-            # Exponential moving average
-            self.values[key] = self.alpha * old_val + (1 - self.alpha) * raw_value
-            # Trend = rate of change
-            self.trends[key] = raw_value - old_val
-        
-        return self.values[key], self.trends[key]
-    
-    def get(self, key: str) -> Tuple[float, float]:
-        """Get current smoothed value and trend"""
-        return self.values.get(key, 0.0), self.trends.get(key, 0.0)
-    
-    def reset(self):
-        """Reset all smoothed values"""
-        self.values.clear()
-        self.trends.clear()
+class LocustMetricsCollector:
+    def __init__(self, locust_url: str = "http://localhost:8089"):
+        self.url = locust_url
+        self.logger = logging.getLogger('Locust')
+        self._cache = {}
+        self._cache_time = 0
+        self._cache_ttl = 2.0
 
-
-# =============================================================================
-# PRIORITIZED EXPERIENCE REPLAY
-# =============================================================================
-
-class PrioritizedReplayBuffer:
-    """
-    Prioritized Experience Replay Buffer
-    
-    Samples experiences based on TD-error priority, ensuring diverse
-    learning and preventing memorization of recent sequences.
-    
-    From Schaul et al. (2015) and adapted for tabular Q-learning.
-    """
-    
-    def __init__(self, capacity: int = 500, alpha: float = 0.6, beta: float = 0.4):
-        self.capacity = capacity
-        self.alpha = alpha  # Priority exponent (0 = uniform, 1 = full prioritization)
-        self.beta = beta    # Importance sampling exponent
-        self.buffer: List[Tuple] = []
-        self.priorities: List[float] = []
-        self.position = 0
-    
-    def add(self, state: Tuple, action: int, reward: float, 
-            next_state: Tuple, td_error: float):
-        """Add experience with priority based on TD-error"""
-        priority = (abs(td_error) + 0.01) ** self.alpha
-        
-        experience = (state, action, reward, next_state)
-        
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(experience)
-            self.priorities.append(priority)
-        else:
-            self.buffer[self.position] = experience
-            self.priorities[self.position] = priority
-        
-        self.position = (self.position + 1) % self.capacity
-    
-    def sample(self, batch_size: int = 16) -> List[Tuple]:
-        """Sample batch based on priorities"""
-        if len(self.buffer) < batch_size:
-            return list(self.buffer)
-        
-        # Convert priorities to probabilities
-        priorities_array = np.array(self.priorities)
-        probs = priorities_array / priorities_array.sum()
-        
-        # Sample without replacement
-        indices = np.random.choice(
-            len(self.buffer), 
-            size=min(batch_size, len(self.buffer)),
-            p=probs,
-            replace=False
-        )
-        
-        return [self.buffer[i] for i in indices]
-    
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-
-# =============================================================================
-# DOUBLE Q-LEARNING AGENT (Harchol-Balter variance discussion)
-# =============================================================================
-
-class DoubleQLearningAgent:
-    """
-    Double Q-Learning Agent with Anti-Overfitting Measures
-    
-    Key features:
-    - Double Q-Learning to reduce overestimation bias
-    - Reduced state space (8 states) for better generalization
-    - Reward noise injection
-    - Q-value regularization (weight decay)
-    - Slower epsilon decay with higher floor
-    - Prioritized experience replay
-    
-    Based on:
-    - Harchol-Balter Ch. 14: Variance reduction
-    - Jain Ch. 6: Model simplicity for generalization
-    - INTROD_1 Ch. 3: Statistical estimation
-    """
-    
-    def __init__(
-        self,
-        service_name: str,
-        alpha: float = 0.1,
-        gamma: float = 0.9,
-        epsilon: float = 0.5,
-        epsilon_decay: float = 0.999,
-        epsilon_min: float = 0.10,
-        weight_decay: float = 0.001,
-        reward_noise_std: float = 0.1
-    ):
-        self.service_name = service_name
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.weight_decay = weight_decay
-        self.reward_noise_std = reward_noise_std
-        
-        # Double Q-Learning: Two Q-tables
-        self.q_table_A: Dict[Tuple, List[float]] = {}
-        self.q_table_B: Dict[Tuple, List[float]] = {}
-        self.use_A = True  # Alternates which table to update
-        
-        # Prioritized replay buffer
-        self.replay_buffer = PrioritizedReplayBuffer(capacity=500)
-        
-        # Statistics
-        self.total_updates = 0
-        self.state_visits: Dict[Tuple, int] = defaultdict(int)
-        
-        # REDUCED state thresholds (2 buckets per dimension = 8 total states)
-        # From Jain Ch. 6: Simpler models generalize better
-        self.cpu_threshold = 0.5      # Low / High
-        self.lat_threshold = 1.0      # Good / Bad (relative to SLA)
-        self.pod_threshold = 0.5      # Few / Many
-        
-        logger.info(f"[{service_name}] DoubleQLearningAgent initialized")
-        logger.info(f"  State space: 2×2×2 = 8 states (reduced for generalization)")
-        logger.info(f"  ε={epsilon}, decay={epsilon_decay}, min={epsilon_min}")
-    
-    def get_state(
-        self,
-        cpu_util: float,
-        latency_score: float,
-        pod_ratio: float,
-        **kwargs
-    ) -> Tuple[int, int, int]:
-        """
-        Convert continuous metrics to discrete state
-        
-        REDUCED state space (8 states) to prevent overfitting
-        """
-        cpu_state = 0 if cpu_util < self.cpu_threshold else 1
-        lat_state = 0 if latency_score < self.lat_threshold else 1
-        pod_state = 0 if pod_ratio < self.pod_threshold else 1
-        
-        return (cpu_state, lat_state, pod_state)
-    
-    def _init_q_values(self, state: Tuple) -> List[float]:
-        """Initialize Q-values for a new state with slight preference for STAY"""
-        return [0.0, 0.1, 0.0]  # [SCALE_DOWN, STAY, SCALE_UP]
-    
-    def _ensure_state_exists(self, state: Tuple):
-        """Ensure state exists in both Q-tables"""
-        if state not in self.q_table_A:
-            self.q_table_A[state] = self._init_q_values(state)
-        if state not in self.q_table_B:
-            self.q_table_B[state] = self._init_q_values(state)
-    
-    def get_q_values(self, state: Tuple) -> List[float]:
-        """Get averaged Q-values from both tables"""
-        self._ensure_state_exists(state)
-        q_a = self.q_table_A[state]
-        q_b = self.q_table_B[state]
-        return [(a + b) / 2 for a, b in zip(q_a, q_b)]
-    
-    def choose_action(self, state: Tuple, training: bool = True) -> int:
-        """
-        Choose action using ε-greedy policy
-        
-        Args:
-            state: Current state tuple
-            training: If False, use pure exploitation (ε=0)
-        
-        Returns:
-            Action index (0=SCALE_DOWN, 1=STAY, 2=SCALE_UP)
-        """
-        self._ensure_state_exists(state)
-        self.state_visits[state] += 1
-        
-        effective_epsilon = self.epsilon if training else 0.0
-        
-        if np.random.random() < effective_epsilon:
-            return np.random.randint(0, 3)
-        else:
-            q_values = self.get_q_values(state)
-            return int(np.argmax(q_values))
-    
-    def learn(
-        self,
-        state: Tuple,
-        action: int,
-        reward: float,
-        next_state: Tuple
-    ) -> float:
-        """
-        Double Q-Learning update with regularization
-        
-        Returns:
-            TD-error for prioritized replay
-        """
-        # Add noise to reward to prevent memorization
-        noisy_reward = reward + np.random.normal(0, self.reward_noise_std)
-        noisy_reward = np.clip(noisy_reward, -2.0, 2.0)
-        
-        self._ensure_state_exists(state)
-        self._ensure_state_exists(next_state)
-        
-        # Double Q-Learning: Use one table to select action, other to evaluate
-        if self.use_A:
-            # Use A to select best action, B to evaluate it
-            best_action = int(np.argmax(self.q_table_A[next_state]))
-            target = noisy_reward + self.gamma * self.q_table_B[next_state][best_action]
-            
-            old_q = self.q_table_A[state][action]
-            td_error = target - old_q
-            new_q = old_q + self.alpha * td_error
-            
-            # Apply weight decay (regularization)
-            new_q *= (1 - self.weight_decay)
-            self.q_table_A[state][action] = new_q
-        else:
-            # Use B to select best action, A to evaluate it
-            best_action = int(np.argmax(self.q_table_B[next_state]))
-            target = noisy_reward + self.gamma * self.q_table_A[next_state][best_action]
-            
-            old_q = self.q_table_B[state][action]
-            td_error = target - old_q
-            new_q = old_q + self.alpha * td_error
-            
-            # Apply weight decay
-            new_q *= (1 - self.weight_decay)
-            self.q_table_B[state][action] = new_q
-        
-        # Alternate tables
-        self.use_A = not self.use_A
-        
-        # Store in replay buffer
-        self.replay_buffer.add(state, action, noisy_reward, next_state, td_error)
-        
-        # Replay from buffer
-        if len(self.replay_buffer) >= 16:
-            self._replay_batch(batch_size=8)
-        
-        self.total_updates += 1
-        
-        # Periodic global shrinkage
-        if self.total_updates % 100 == 0:
-            self._apply_global_shrinkage()
-        
-        return td_error
-    
-    def _replay_batch(self, batch_size: int = 8):
-        """Replay experiences from buffer"""
-        batch = self.replay_buffer.sample(batch_size)
-        
-        for state, action, reward, next_state in batch:
-            self._ensure_state_exists(state)
-            self._ensure_state_exists(next_state)
-            
-            # Use averaged Q-values for replay
-            q_values = self.get_q_values(state)
-            next_q_values = self.get_q_values(next_state)
-            
-            old_q = q_values[action]
-            target = reward + self.gamma * max(next_q_values)
-            
-            # Smaller learning rate for replay
-            replay_alpha = 0.5 * self.alpha
-            new_q = old_q + replay_alpha * (target - old_q)
-            
-            # Update both tables slightly
-            self.q_table_A[state][action] = 0.5 * (self.q_table_A[state][action] + new_q)
-            self.q_table_B[state][action] = 0.5 * (self.q_table_B[state][action] + new_q)
-    
-    def _apply_global_shrinkage(self, factor: float = 0.99):
-        """Shrink all Q-values toward zero to prevent extreme values"""
-        for state in self.q_table_A:
-            self.q_table_A[state] = [q * factor for q in self.q_table_A[state]]
-        for state in self.q_table_B:
-            self.q_table_B[state] = [q * factor for q in self.q_table_B[state]]
-    
-    def decay_epsilon(self):
-        """Decay exploration rate"""
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-    
-    def get_stats(self) -> Dict:
-        """Get agent statistics"""
-        return {
-            'service': self.service_name,
-            'epsilon': self.epsilon,
-            'total_updates': self.total_updates,
-            'states_discovered': len(self.q_table_A),
-            'replay_buffer_size': len(self.replay_buffer),
-            'q_table_A': {str(k): v for k, v in self.q_table_A.items()},
-            'q_table_B': {str(k): v for k, v in self.q_table_B.items()},
-            'state_visits': {str(k): v for k, v in self.state_visits.items()}
-        }
-    
-    def save(self, filepath: str):
-        """Save agent state to file"""
-        state = {
-            'service_name': self.service_name,
-            'q_table_A': {str(k): v for k, v in self.q_table_A.items()},
-            'q_table_B': {str(k): v for k, v in self.q_table_B.items()},
-            'epsilon': self.epsilon,
-            'total_updates': self.total_updates,
-            'state_visits': {str(k): v for k, v in self.state_visits.items()}
-        }
-        with open(filepath, 'w') as f:
-            json.dump(state, f, indent=2)
-        logger.info(f"[{self.service_name}] Agent saved to {filepath}")
-    
-    def load(self, filepath: str):
-        """Load agent state from file"""
-        with open(filepath, 'r') as f:
-            state = json.load(f)
-        
-        # Convert string keys back to tuples
-        self.q_table_A = {eval(k): v for k, v in state['q_table_A'].items()}
-        self.q_table_B = {eval(k): v for k, v in state['q_table_B'].items()}
-        self.epsilon = state['epsilon']
-        self.total_updates = state['total_updates']
-        self.state_visits = defaultdict(int, {eval(k): v for k, v in state['state_visits'].items()})
-        
-        logger.info(f"[{self.service_name}] Agent loaded from {filepath}")
-
-
-# =============================================================================
-# BASELINE HPA CONTROLLER
-# =============================================================================
-
-class BaselineHPAController:
-    """
-    Simple CPU-based Horizontal Pod Autoscaler
-    
-    Mimics Kubernetes HPA behavior for comparison baseline.
-    """
-    
-    def __init__(self):
-        self.cooldown_until: Dict[str, float] = {}
-        self.cooldown_period = 30.0  # seconds
-    
-    def decide(self, service: str, metrics: Dict) -> int:
-        """
-        Make scaling decision based on CPU utilization
-        
-        Returns:
-            Action index (0=SCALE_DOWN, 1=STAY, 2=SCALE_UP)
-        """
-        config = SERVICE_CONFIGS[service]
-        cpu_util = metrics.get('cpu_util', 0.5)
-        current_pods = metrics.get('pods_ready', 1)
-        
-        # Check cooldown
-        if service in self.cooldown_until:
-            if time.time() < self.cooldown_until[service]:
-                return ScalingAction.STAY.value
-        
-        # Simple threshold-based decision
-        if cpu_util > config['scale_up_threshold'] / 100.0:
-            if current_pods < config['max']:
-                self.cooldown_until[service] = time.time() + self.cooldown_period
-                return ScalingAction.SCALE_UP.value
-        elif cpu_util < config['scale_down_threshold'] / 100.0:
-            if current_pods > config['min']:
-                self.cooldown_until[service] = time.time() + self.cooldown_period
-                return ScalingAction.SCALE_DOWN.value
-        
-        return ScalingAction.STAY.value
-
-
-# =============================================================================
-# REWARD CALCULATOR (Jain Ch. 12 - Rule 1)
-# =============================================================================
-
-class RewardCalculator:
-    """
-    Reward function following Jain's principles
-    
-    From Jain Ch. 12, Rule 1: "The sum must have physical meaning"
-    
-    Three weighted objectives:
-    - SLA compliance (50%): Primary objective
-    - Resource efficiency (30%): Secondary objective
-    - Stability (20%): Anti-oscillation
-    """
-    
-    def __init__(self):
-        # Weights must sum to 1.0
-        self.w_sla = 0.50
-        self.w_efficiency = 0.30
-        self.w_stability = 0.20
-        
-        # Noise for anti-overfitting
-        self.noise_std = 0.1
-    
-    def calculate(
-        self,
-        service: str,
-        latency_score: float,  # ratio to target (1.0 = at target)
-        cpu_util: float,       # 0-1
-        pods: int,
-        ready_pods: int,
-        action_taken: int
-    ) -> float:
-        """
-        Calculate reward for a scaling decision
-        
-        Args:
-            service: Service name
-            latency_score: Current latency / target latency
-            cpu_util: CPU utilization (0-1)
-            pods: Total pods
-            ready_pods: Ready pods
-            action_taken: Action that was taken (0, 1, 2)
-        
-        Returns:
-            Reward value (clipped to [-2, 2])
-        """
-        config = SERVICE_CONFIGS[service]
-        ready_ratio = ready_pods / max(1, pods)
-        
-        # (1) SLA REWARD (50% weight)
-        if latency_score <= 0.8:
-            sla_reward = 1.0      # Excellent - well below SLA
-        elif latency_score <= 1.0:
-            sla_reward = 0.5      # Good - meeting SLA
-        elif latency_score <= 1.5:
-            sla_reward = -0.5     # Degraded - slightly over SLA
-        else:
-            sla_reward = -1.0     # SLA violation
-        
-        # (2) EFFICIENCY REWARD (30% weight)
-        # Target: 50-70% CPU utilization (optimal operating point)
-        if 0.5 <= cpu_util <= 0.7:
-            eff_reward = 1.0      # Optimal range
-        elif 0.3 <= cpu_util < 0.5 or 0.7 < cpu_util <= 0.85:
-            eff_reward = 0.3      # Acceptable
-        else:
-            eff_reward = -0.5     # Inefficient (too low or too high)
-        
-        # Penalize over-provisioning when SLA is excellent
-        if latency_score < 0.8 and pods > config['min'] + 2:
-            eff_reward -= 0.3
-        
-        # (3) STABILITY REWARD (20% weight)
-        stability_reward = 0.0
-        
-        # Penalize scaling when pods aren't ready
-        if ready_ratio < 0.8 and action_taken != ScalingAction.STAY.value:
-            stability_reward = -1.0
-        # Slight penalty for any scaling action (prefer stability)
-        elif action_taken == ScalingAction.SCALE_UP.value:
-            stability_reward = -0.2
-        elif action_taken == ScalingAction.SCALE_DOWN.value:
-            stability_reward = -0.1
-        
-        # WEIGHTED COMBINATION
-        base_reward = (
-            self.w_sla * sla_reward +
-            self.w_efficiency * eff_reward +
-            self.w_stability * stability_reward
-        )
-        
-        # Add noise for anti-overfitting
-        noise = np.random.normal(0, self.noise_std)
-        reward = base_reward + noise
-        
-        # Clip to prevent extreme values
-        return float(np.clip(reward, -2.0, 2.0))
-
-
-# =============================================================================
-# LITTLE'S LAW PREDICTOR (Harchol-Balter Ch. 6)
-# =============================================================================
-
-class LittleLawPredictor:
-    """
-    Proactive scaling using Little's Law
-    
-    From Harchol-Balter Chapter 6:
-    N = λ × T
-    
-    Where:
-    - N = number in system (expected queue length)
-    - λ = arrival rate (requests/sec)
-    - T = mean response time (seconds)
-    """
-    
-    def __init__(self, concurrent_per_pod: int = 10):
-        self.concurrent_per_pod = concurrent_per_pod
-    
-    def estimate_optimal_pods(
-        self,
-        service: str,
-        arrival_rate: float,
-        target_latency_sec: float
-    ) -> int:
-        """
-        Estimate optimal pod count using Little's Law
-        
-        Args:
-            service: Service name
-            arrival_rate: Requests per second
-            target_latency_sec: Target response time in seconds
-        
-        Returns:
-            Estimated optimal number of pods
-        """
-        config = SERVICE_CONFIGS[service]
-        
-        # Expected number in system at target latency
-        expected_queue = arrival_rate * target_latency_sec
-        
-        # Required pods to handle this queue
-        optimal_pods = int(np.ceil(expected_queue / self.concurrent_per_pod))
-        
-        # Clamp to service limits
-        return max(config['min'], min(optimal_pods, config['max']))
-
-
-# =============================================================================
-# METRICS COLLECTOR
-# =============================================================================
-
-class MetricsCollector:
-    """
-    Collects metrics from Prometheus and Kubernetes
-    """
-    
-    def __init__(self, prometheus_url: str = PROMETHEUS_URL):
-        self.prometheus_url = prometheus_url
-        self.smoother = MetricSmoother(alpha=0.3)
-    
-    def query_prometheus(self, query: str) -> Optional[float]:
-        """Execute PromQL query and return result"""
+    def is_available(self) -> bool:
         try:
-            import requests
-            response = requests.get(
-                f"{self.prometheus_url}/api/v1/query",
-                params={'query': query},
+            r = requests.get(f"{self.url}/stats/requests", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def get_stats(self) -> Optional[Dict]:
+        if time.time() - self._cache_time < self._cache_ttl:
+            return self._cache
+
+        try:
+            r = requests.get(f"{self.url}/stats/requests", timeout=5)
+            if r.status_code == 200:
+                self._cache = r.json()
+                self._cache_time = time.time()
+                return self._cache
+        except Exception as e:
+            self.logger.warning(f"Failed to get Locust stats: {e}")
+        return None
+
+    def _get_avg_from_stats(self, stats: Dict) -> float:
+        for endpoint in stats.get('stats', []):
+            if endpoint.get('name') == 'Aggregated':
+                return endpoint.get('avg_response_time', 0) or 0
+        return 0
+
+    def _get_max_from_stats(self, stats: Dict) -> float:
+        for endpoint in stats.get('stats', []):
+            if endpoint.get('name') == 'Aggregated':
+                return endpoint.get('max_response_time', 0) or 0
+        return 0
+
+    def get_aggregate_latency(self) -> Dict:
+        stats = self.get_stats()
+        if not stats:
+            return {}
+
+        p95 = stats.get('current_response_time_percentile_95', 0) or 0
+        return {
+            'p50_ms': stats.get('current_response_time_percentile_50', 0) or 0,
+            'p95_ms': p95,
+            'p99_ms': (p95 * 1.3) if p95 else 0.0,
+            'avg_ms': self._get_avg_from_stats(stats),
+            'max_ms': self._get_max_from_stats(stats),
+            'rps': stats.get('total_rps', 0) or 0,
+            'fail_ratio': stats.get('fail_ratio', 0) or 0
+        }
+
+    def set_user_count(self, count: int) -> bool:
+        try:
+            r = requests.post(
+                f"{self.url}/swarm",
+                data={'user_count': count, 'spawn_rate': max(1, count // 10)},
                 timeout=5
             )
-            data = response.json()
-            
-            if data['status'] == 'success' and data['data']['result']:
-                return float(data['data']['result'][0]['value'][1])
-            return None
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+class PrometheusMetricsCollector:
+    def __init__(self, prometheus_url: str = "http://localhost:9090", namespace: str = "default"):
+        self.url = prometheus_url
+        self.namespace = namespace
+        self.logger = logging.getLogger('Prometheus')
+
+    def is_available(self) -> bool:
+        try:
+            r = requests.get(f"{self.url}/api/v1/status/config", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def query(self, promql: str) -> Optional[float]:
+        try:
+            r = requests.get(
+                f"{self.url}/api/v1/query",
+                params={'query': promql},
+                timeout=10
+            )
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            if data.get('status') != 'success':
+                return None
+
+            result = data.get('data', {}).get('result', [])
+            if not result:
+                return None
+
+            # PATCH: if multiple series return, take mean of values
+            vals = []
+            for item in result:
+                try:
+                    vals.append(float(item['value'][1]))
+                except Exception:
+                    continue
+            return float(np.mean(vals)) if vals else None
+
         except Exception as e:
-            logger.warning(f"Prometheus query failed: {e}")
+            self.logger.debug(f"Query failed: {promql[:80]}... - {e}")
             return None
-    
-    def get_pod_count(self, service: str, namespace: str = 'default') -> Tuple[int, int, int]:
-        """Get pod counts (desired, ready, available) from kubectl"""
+
+    def get_cpu_utilization(self, deployment: str) -> Optional[float]:
+        query = f'''
+        sum(rate(container_cpu_usage_seconds_total{{
+            namespace="{self.namespace}",
+            pod=~"{deployment}.*",
+            container!=""
+        }}[2m]))
+        /
+        sum(kube_pod_container_resource_requests{{
+            namespace="{self.namespace}",
+            pod=~"{deployment}.*",
+            resource="cpu"
+        }})
+        '''
+        result = self.query(query)
+        if result is not None:
+            return min(result, 2.0)
+        return None
+
+    def get_memory_utilization(self, deployment: str) -> Optional[float]:
+        query = f'''
+        sum(container_memory_working_set_bytes{{
+            namespace="{self.namespace}",
+            pod=~"{deployment}.*",
+            container!=""
+        }})
+        /
+        sum(kube_pod_container_resource_requests{{
+            namespace="{self.namespace}",
+            pod=~"{deployment}.*",
+            resource="memory"
+        }})
+        '''
+        return self.query(query)
+
+    def get_pod_counts(self, deployment: str) -> Tuple[int, int, int]:
+        ready = self.query(f'kube_deployment_status_replicas_ready{{namespace="{self.namespace}", deployment="{deployment}"}}')
+        current = self.query(f'kube_deployment_status_replicas{{namespace="{self.namespace}", deployment="{deployment}"}}')
+        desired = self.query(f'kube_deployment_spec_replicas{{namespace="{self.namespace}", deployment="{deployment}"}}')
+
+        return (int(ready) if ready else 1, int(current) if current else 1, int(desired) if desired else 1)
+
+    def has_latency_metrics(self) -> Tuple[bool, str]:
+        patterns = [
+            ('istio_request_duration_milliseconds_bucket', 'Istio'),
+            ('nginx_ingress_controller_request_duration_seconds_bucket', 'NGINX Ingress'),
+            ('http_request_duration_seconds_bucket', 'Generic HTTP'),
+        ]
+        for metric, source in patterns:
+            result = self.query(f'count({metric})')
+            if result and result > 0:
+                return True, source
+        return False, "None (use Locust for latency)"
+
+
+class KubectlMetricsCollector:
+    def __init__(self, namespace: str = "default"):
+        self.namespace = namespace
+        self.logger = logging.getLogger('Kubectl')
+
+    def get_pod_counts(self, deployment: str) -> Tuple[int, int, int]:
         try:
             result = subprocess.run(
-                ['kubectl', 'get', 'deployment', service, '-n', namespace,
-                 '-o', 'jsonpath={.spec.replicas},{.status.readyReplicas},{.status.availableReplicas}'],
+                ['kubectl', 'get', 'deployment', deployment, '-n', self.namespace,
+                 '-o', 'jsonpath={.status.readyReplicas},{.status.replicas},{.spec.replicas}'],
                 capture_output=True, text=True, timeout=10
             )
             parts = result.stdout.strip().split(',')
-            desired = int(parts[0]) if parts[0] else 1
-            ready = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-            available = int(parts[2]) if len(parts) > 2 and parts[2] else 0
-            return desired, ready, available
-        except Exception as e:
-            logger.warning(f"Failed to get pod count for {service}: {e}")
-            return 1, 1, 1
-    
-    def collect_service_metrics(self, service: str) -> ServiceMetrics:
-        """Collect all metrics for a service"""
-        config = SERVICE_CONFIGS[service]
-        
-        # Query Prometheus for various metrics
-        cpu_query = f'avg(rate(container_cpu_usage_seconds_total{{pod=~"{service}.*"}}[1m]))'
-        mem_query = f'avg(container_memory_usage_bytes{{pod=~"{service}.*"}})'
-        lat_p50_query = f'histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{{service="{service}"}}[1m]))'
-        lat_p95_query = f'histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{{service="{service}"}}[1m]))'
-        lat_p99_query = f'histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{{service="{service}"}}[1m]))'
-        rate_query = f'sum(rate(http_requests_total{{service="{service}"}}[1m]))'
-        error_query = f'sum(rate(http_requests_total{{service="{service}",status=~"5.."}}[1m]))'
-        
-        # Collect raw values
-        raw_cpu = self.query_prometheus(cpu_query) or 0.0
-        raw_mem = self.query_prometheus(mem_query) or 0.0
-        raw_lat_p50 = (self.query_prometheus(lat_p50_query) or 0.0) * 1000  # to ms
-        raw_lat_p95 = (self.query_prometheus(lat_p95_query) or 0.0) * 1000
-        raw_lat_p99 = (self.query_prometheus(lat_p99_query) or 0.0) * 1000
-        raw_rate = self.query_prometheus(rate_query) or 0.0
-        raw_error = self.query_prometheus(error_query) or 0.0
-        
-        # Get pod counts
-        pods_desired, pods_ready, pods_available = self.get_pod_count(service)
-        
-        # Apply exponential smoothing
-        cpu_util, _ = self.smoother.update(f'{service}_cpu', raw_cpu)
-        lat_p95, lat_trend = self.smoother.update(f'{service}_lat', raw_lat_p95)
-        
-        return ServiceMetrics(
-            timestamp=time.time(),
-            service=service,
-            cpu_util=cpu_util,
-            memory_util=raw_mem / (1024 * 1024 * 1024),  # to GB
-            latency_p50_ms=raw_lat_p50,
-            latency_p95_ms=lat_p95,
-            latency_p99_ms=raw_lat_p99,
-            request_rate=raw_rate,
-            error_rate=raw_error / max(raw_rate, 0.001),
-            pods_desired=pods_desired,
-            pods_ready=pods_ready,
-            pods_available=pods_available
-        )
-    
-    def collect_all_metrics(self) -> Dict[str, ServiceMetrics]:
-        """Collect metrics for all services"""
-        metrics = {}
-        for service in SERVICE_CONFIGS:
-            metrics[service] = self.collect_service_metrics(service)
-        return metrics
+            ready = int(parts[0]) if parts[0] else 1
+            current = int(parts[1]) if len(parts) > 1 and parts[1] else ready
+            desired = int(parts[2]) if len(parts) > 2 and parts[2] else current
+            return (ready, current, desired)
+        except Exception:
+            return (1, 1, 1)
 
-
-# =============================================================================
-# SCALING EXECUTOR
-# =============================================================================
-
-class ScalingExecutor:
-    """
-    Executes scaling decisions via kubectl
-    """
-    
-    def __init__(self, namespace: str = 'default', dry_run: bool = False):
-        self.namespace = namespace
-        self.dry_run = dry_run
-        self.scaling_history: List[Dict] = []
-    
-    def scale(self, service: str, action: int, current_pods: int) -> bool:
-        """
-        Execute scaling action
-        
-        Args:
-            service: Service name
-            action: Action (0=down, 1=stay, 2=up)
-            current_pods: Current pod count
-        
-        Returns:
-            True if scaling was executed
-        """
-        config = SERVICE_CONFIGS[service]
-        
-        if action == ScalingAction.STAY.value:
-            return False
-        
-        if action == ScalingAction.SCALE_UP.value:
-            new_pods = min(current_pods + 1, config['max'])
-        else:  # SCALE_DOWN
-            new_pods = max(current_pods - 1, config['min'])
-        
-        if new_pods == current_pods:
-            return False
-        
-        self.scaling_history.append({
-            'timestamp': time.time(),
-            'service': service,
-            'action': 'scale_up' if action == ScalingAction.SCALE_UP.value else 'scale_down',
-            'from_pods': current_pods,
-            'to_pods': new_pods
-        })
-        
-        if self.dry_run:
-            logger.info(f"[DRY RUN] Would scale {service}: {current_pods} → {new_pods}")
-            return True
-        
+    def scale_deployment(self, deployment: str, replicas: int) -> bool:
         try:
-            cmd = [
-                'kubectl', 'scale', 'deployment', service,
-                f'--replicas={new_pods}',
-                '-n', self.namespace
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode == 0:
-                logger.info(f"Scaled {service}: {current_pods} → {new_pods}")
-                return True
-            else:
-                logger.error(f"Scaling failed: {result.stderr}")
-                return False
+            result = subprocess.run(
+                ['kubectl', 'scale', 'deployment', deployment,
+                 '-n', self.namespace, f'--replicas={replicas}'],
+                capture_output=True, text=True, timeout=30
+            )
+            return result.returncode == 0
         except Exception as e:
-            logger.error(f"Scaling error: {e}")
+            self.logger.error(f"Failed to scale {deployment}: {e}")
             return False
 
 
+class UnifiedMetricsCollector:
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self.logger = logging.getLogger('Metrics')
+
+        self.locust = LocustMetricsCollector(config.locust_url)
+        self.prometheus = PrometheusMetricsCollector(config.prometheus_url, config.namespace)
+        self.kubectl = KubectlMetricsCollector(config.namespace)
+
+        self.locust_available = self.locust.is_available()
+        self.prometheus_available = self.prometheus.is_available()
+
+        self._smoothed: Dict[str, ServiceMetrics] = {}
+
+        self.logger.info(f"Locust available: {self.locust_available}")
+        self.logger.info(f"Prometheus available: {self.prometheus_available}")
+
+    def collect(self, service: str) -> ServiceMetrics:
+        metrics = ServiceMetrics(timestamp=time.time(), service_name=service)
+
+        if self.locust_available:
+            latency = self.locust.get_aggregate_latency()
+            if latency:
+                metrics.latency_p50_ms = latency.get('p50_ms', 0)
+                metrics.latency_p95_ms = latency.get('p95_ms', 0)
+                metrics.latency_p99_ms = latency.get('p99_ms', 0)
+                metrics.latency_avg_ms = latency.get('avg_ms', 0)
+                metrics.latency_max_ms = latency.get('max_ms', 0)
+                metrics.arrival_rate = latency.get('rps', 0)
+                metrics.failure_rate = latency.get('fail_ratio', 0)
+                metrics.latency_source = 'locust'
+
+        if self.prometheus_available:
+            cpu = self.prometheus.get_cpu_utilization(service)
+            if cpu is not None:
+                metrics.cpu_utilization = cpu
+
+            mem = self.prometheus.get_memory_utilization(service)
+            if mem is not None:
+                metrics.memory_utilization = mem
+
+            ready, current, desired = self.prometheus.get_pod_counts(service)
+            metrics.ready_replicas = ready
+            metrics.current_replicas = current
+            metrics.desired_replicas = desired
+            metrics.resource_source = 'prometheus'
+        else:
+            ready, current, desired = self.kubectl.get_pod_counts(service)
+            metrics.ready_replicas = ready
+            metrics.current_replicas = current
+            metrics.desired_replicas = desired
+            metrics.resource_source = 'kubectl'
+
+        return self._apply_smoothing(service, metrics)
+
+    def _apply_smoothing(self, service: str, new: ServiceMetrics) -> ServiceMetrics:
+        if service not in self._smoothed:
+            self._smoothed[service] = new
+            return new
+
+        old = self._smoothed[service]
+        alpha = self.config.smoothing_alpha
+
+        for field_name in ['latency_p50_ms', 'latency_p95_ms', 'latency_avg_ms',
+                           'arrival_rate', 'cpu_utilization']:
+            old_val = getattr(old, field_name, 0) or 0
+            new_val = getattr(new, field_name, 0) or 0
+            if new_val > 0:
+                setattr(new, field_name, alpha * new_val + (1 - alpha) * old_val)
+
+        self._smoothed[service] = new
+        return new
+
+    def collect_all(self) -> Dict[str, ServiceMetrics]:
+        return {svc: self.collect(svc) for svc in self.config.services.keys()}
+
+
 # =============================================================================
-# SHADOW MODE ANALYZER
+# SECTION 4: LITTLE'S LAW (Projection + Stability)
 # =============================================================================
 
-class ShadowModeAnalyzer:
-    """
-    Analyzes Shadow Mode logs to detect overfitting and readiness
-    """
-    
-    def __init__(self, decisions: List[ScalingDecision]):
-        self.decisions = decisions
-    
-    def agreement_rate(self) -> float:
-        """Calculate how often RL agrees with baseline"""
-        if not self.decisions:
-            return 0.0
-        
-        agreed = sum(
-            1 for d in self.decisions 
-            if d.rl_action == d.baseline_action
+class LittleLawValidator:
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self.logger = logging.getLogger('LittleLaw')
+        self.history: Dict[str, deque] = {}
+
+    def validate(self, service: str, metrics: ServiceMetrics, service_capacity: float = None) -> SystemState:
+        if service_capacity is None:
+            svc_config = self.config.services.get(service)
+            service_capacity = svc_config.capacity_per_pod if svc_config else 100.0
+
+        lambda_rate = metrics.arrival_rate
+        response_time_sec = metrics.latency_avg_ms / 1000.0
+        num_pods = max(1, metrics.ready_replicas)
+
+        predicted_queue = lambda_rate * response_time_sec  # projection
+        total_capacity = num_pods * service_capacity
+        utilization = lambda_rate / total_capacity if total_capacity > 0 else 1.0
+        is_stable = utilization < self.config.stability_threshold
+
+        in_steady_state, _ = self._check_steady_state(service)
+
+        state = SystemState(
+            timestamp=time.time(),
+            arrival_rate=lambda_rate,
+            response_time_avg_sec=response_time_sec,
+            predicted_queue_length=predicted_queue,
+            num_servers=num_pods,
+            service_rate_per_server=service_capacity,
+            utilization=utilization,
+            is_stable=is_stable,
+            little_law_error=0.0,   # no measured N in this implementation
+            in_steady_state=in_steady_state
         )
-        return agreed / len(self.decisions)
-    
-    def analyze_disagreements(self) -> Dict:
-        """Analyze cases where RL and baseline disagree"""
-        disagreements = [d for d in self.decisions if d.rl_action != d.baseline_action]
-        
-        if not disagreements:
-            return {'total': 0, 'rl_better': 0, 'baseline_better': 0}
-        
-        rl_better = 0
-        baseline_better = 0
-        
-        # Simple heuristic: check subsequent metrics
-        for i, d in enumerate(disagreements):
-            # Find next decision for same service
-            for j in range(i + 1, len(self.decisions)):
-                if self.decisions[j].service == d.service:
-                    next_d = self.decisions[j]
-                    # Compare latency outcomes
-                    if next_d.metrics_before.get('latency_score', 1.0) > 1.2:
-                        # High latency after - who would have helped?
-                        if d.rl_action == ScalingAction.SCALE_UP.value:
-                            rl_better += 1
-                        else:
-                            baseline_better += 1
-                    break
-        
+
+        if service not in self.history:
+            self.history[service] = deque(maxlen=30)
+        self.history[service].append(state)
+
+        return state
+
+    def _check_steady_state(self, service: str) -> Tuple[bool, str]:
+        if service not in self.history or len(self.history[service]) < 5:
+            return False, "Insufficient history"
+
+        history = list(self.history[service])[-10:]
+
+        rates = [s.arrival_rate for s in history if s.arrival_rate > 0]
+        if rates:
+            mean = np.mean(rates)
+            if mean > 0:
+                cv = np.std(rates) / mean
+                if cv > 0.3:
+                    return False, f"Arrival rate unstable (CV={cv:.2f})"
+
+        times = [s.response_time_avg_sec for s in history if s.response_time_avg_sec > 0]
+        if times:
+            mean = np.mean(times)
+            if mean > 0:
+                cv = np.std(times) / mean
+                if cv > 0.4:
+                    return False, f"Response time unstable (CV={cv:.2f})"
+
+        utils = [s.utilization for s in history]
+        if len(utils) >= 5:
+            x = np.arange(len(utils))
+            slope = np.polyfit(x, utils, 1)[0]
+            if slope > 0.01:
+                return False, f"Utilization trending up (slope={slope:.3f})"
+
+        return True, "System in steady-state"
+
+    def calculate_optimal_pods(self, arrival_rate: float, service_capacity: float, target_utilization: float = None) -> Tuple[int, Dict]:
+        if target_utilization is None:
+            target_utilization = self.config.target_utilization
+        if service_capacity <= 0:
+            return 1, {}
+
+        min_stable = math.ceil(arrival_rate / service_capacity) if arrival_rate > 0 else 1
+        min_stable = max(1, min_stable)
+
+        optimal = math.ceil(arrival_rate / (target_utilization * service_capacity)) if arrival_rate > 0 else 1
+        optimal = max(1, optimal, min_stable)
+
+        max_rps = optimal * service_capacity * self.config.stability_threshold
+        return optimal, {
+            'min_stable_pods': min_stable,
+            'optimal_pods': optimal,
+            'max_sustainable_rps': max_rps,
+            'at_utilization': target_utilization
+        }
+
+
+# =============================================================================
+# SECTION 5: DOUBLE Q-LEARNING
+# =============================================================================
+
+def _state_to_key(state: Tuple[int, int, int]) -> str:
+    return ",".join(str(x) for x in state)
+
+def _key_to_state(key: str) -> Tuple[int, int, int]:
+    parts = key.split(",")
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+
+class DoubleQLearningAgent:
+    def __init__(self, service: str, config: Config = CONFIG):
+        self.service = service
+        self.config = config
+        self.logger = logging.getLogger(f'RL:{service}')
+
+        self.state_dims = (2, 2, 2)
+        self.n_actions = 3
+
+        self.q_table_A: Dict[Tuple[int, int, int], List[float]] = defaultdict(lambda: [0.0] * self.n_actions)
+        self.q_table_B: Dict[Tuple[int, int, int], List[float]] = defaultdict(lambda: [0.0] * self.n_actions)
+        self.use_table_A = True
+
+        self.alpha = config.learning_rate
+        self.gamma = config.discount_factor
+        self.epsilon = config.epsilon_start
+        self.epsilon_min = config.epsilon_min
+        self.epsilon_decay = config.epsilon_decay
+
+        self.replay_buffer: deque = deque(maxlen=500)
+        self.batch_size = 16
+
+        self.total_updates = 0
+        self.state_visits: Dict[Tuple[int, int, int], int] = defaultdict(int)
+        self.action_counts: Dict[int, int] = defaultdict(int)
+
+    def discretize_state(self, cpu_util: float, latency_ratio: float, pod_ratio: float) -> Tuple[int, int, int]:
+        cpu_level = 1 if cpu_util > 0.5 else 0
+        latency_level = 1 if latency_ratio > 1.0 else 0
+        pod_level = 1 if pod_ratio > 0.5 else 0
+        return (cpu_level, latency_level, pod_level)
+
+    def choose_action(self, state: Tuple[int, int, int], training: bool = True) -> ScalingAction:
+        self.state_visits[state] += 1
+
+        if training and random.random() < self.epsilon:
+            action = ScalingAction(random.randint(0, self.n_actions - 1))
+        else:
+            q_A = self.q_table_A[state]
+            q_B = self.q_table_B[state]
+            q_avg = [(a + b) / 2 for a, b in zip(q_A, q_B)]
+            action = ScalingAction(int(np.argmax(q_avg)))
+
+        self.action_counts[action.value] += 1
+        return action
+
+    def update(self, state: Tuple[int, int, int], action: ScalingAction, reward: float, next_state: Tuple[int, int, int]):
+        noisy_reward = reward + float(np.random.normal(0, 0.1))
+        self.replay_buffer.append((state, action.value, noisy_reward, next_state))
+
+        if self.use_table_A:
+            best_action = int(np.argmax(self.q_table_A[next_state]))
+            target = noisy_reward + self.gamma * self.q_table_B[next_state][best_action]
+            old_q = self.q_table_A[state][action.value]
+            self.q_table_A[state][action.value] = old_q + self.alpha * (target - old_q)
+        else:
+            best_action = int(np.argmax(self.q_table_B[next_state]))
+            target = noisy_reward + self.gamma * self.q_table_A[next_state][best_action]
+            old_q = self.q_table_B[state][action.value]
+            self.q_table_B[state][action.value] = old_q + self.alpha * (target - old_q)
+
+        self.use_table_A = not self.use_table_A
+        self.total_updates += 1
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def replay(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+        indices = random.sample(range(len(self.replay_buffer)), self.batch_size)
+        replay_alpha = self.alpha * 0.5
+
+        for idx in indices:
+            state, action, reward, next_state = self.replay_buffer[idx]
+            if self.use_table_A:
+                best_action = int(np.argmax(self.q_table_A[next_state]))
+                target = reward + self.gamma * self.q_table_B[next_state][best_action]
+                old_q = self.q_table_A[state][action]
+                self.q_table_A[state][action] = old_q + replay_alpha * (target - old_q)
+            else:
+                best_action = int(np.argmax(self.q_table_B[next_state]))
+                target = reward + self.gamma * self.q_table_A[next_state][best_action]
+                old_q = self.q_table_B[state][action]
+                self.q_table_B[state][action] = old_q + replay_alpha * (target - old_q)
+
+    def get_stats(self) -> Dict:
         return {
-            'total': len(disagreements),
-            'rl_better': rl_better,
-            'baseline_better': baseline_better,
-            'rl_win_rate': rl_better / max(1, rl_better + baseline_better)
+            'service': self.service,
+            'epsilon': self.epsilon,
+            'total_updates': self.total_updates,
+            'states_discovered': len(self.state_visits),
+            'state_visits': { _state_to_key(k): v for k, v in self.state_visits.items() },
+            'action_counts': dict(self.action_counts),
+            'replay_buffer_size': len(self.replay_buffer),
         }
-    
-    def ready_for_active_mode(self, min_observations: int = 500) -> Tuple[bool, Dict]:
-        """
-        Check if RL is ready to transition from Shadow to Active mode
-        
-        Criteria from INTROD_1: Validate before deployment
-        """
-        agreement = self.agreement_rate()
-        disagreement_analysis = self.analyze_disagreements()
-        
-        criteria = {
-            'sufficient_observations': len(self.decisions) >= min_observations,
-            'reasonable_agreement': agreement >= 0.6,
-            'rl_adds_value': disagreement_analysis['rl_win_rate'] >= 0.4,
+
+    def save(self, path: str):
+        data = {
+            'service': self.service,
+            'epsilon': self.epsilon,
+            'total_updates': self.total_updates,
+            'state_visits': { _state_to_key(k): v for k, v in self.state_visits.items() },
+            'action_counts': dict(self.action_counts),
+            'q_table_A': { _state_to_key(k): v for k, v in self.q_table_A.items() },
+            'q_table_B': { _state_to_key(k): v for k, v in self.q_table_B.items() },
         }
-        
-        ready = all(criteria.values())
-        
-        return ready, {
-            'ready': ready,
-            'observations': len(self.decisions),
-            'agreement_rate': agreement,
-            'disagreement_analysis': disagreement_analysis,
-            'criteria': criteria
-        }
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def load(self, path: str):
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        self.epsilon = data.get('epsilon', self.epsilon)
+        self.total_updates = data.get('total_updates', 0)
+
+        for k, v in data.get('q_table_A', {}).items():
+            self.q_table_A[_key_to_state(k)] = v
+        for k, v in data.get('q_table_B', {}).items():
+            self.q_table_B[_key_to_state(k)] = v
+        for k, v in data.get('state_visits', {}).items():
+            self.state_visits[_key_to_state(k)] = v
 
 
 # =============================================================================
-# MAPE-K CONTROLLER
+# SECTION 6: BASELINE
 # =============================================================================
+
+class BaselineHPAController:
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self.logger = logging.getLogger('BaselineHPA')
+
+    def decide(self, service: str, cpu_util: float, ready_pods: int) -> ScalingAction:
+        svc_config = self.config.services.get(service)
+        if not svc_config:
+            return ScalingAction.STAY
+
+        target_cpu = svc_config.target_cpu_percent / 100.0
+        scale_up_threshold = target_cpu * 1.4
+        scale_down_threshold = target_cpu * 0.6
+
+        if cpu_util > scale_up_threshold and ready_pods < svc_config.max_replicas:
+            return ScalingAction.SCALE_UP
+        if cpu_util < scale_down_threshold and ready_pods > svc_config.min_replicas:
+            return ScalingAction.SCALE_DOWN
+        return ScalingAction.STAY
+
+
+# =============================================================================
+# SECTION 7: REWARD
+# =============================================================================
+
+class RewardCalculator:
+    def __init__(self, weights: Tuple[float, float, float] = (0.5, 0.3, 0.2)):
+        self.w_sla, self.w_eff, self.w_stab = weights
+
+    def calculate(self, latency_ratio: float, cpu_util: float, action: ScalingAction, pods_ready_ratio: float) -> float:
+        if latency_ratio <= 0.8:
+            r_sla = 1.0
+        elif latency_ratio <= 1.0:
+            r_sla = 0.5
+        elif latency_ratio <= 1.5:
+            r_sla = -0.5
+        elif latency_ratio <= 2.0:
+            r_sla = -1.0
+        else:
+            r_sla = -2.0
+
+        if 0.5 <= cpu_util <= 0.7:
+            r_eff = 1.0
+        elif 0.3 <= cpu_util <= 0.85:
+            r_eff = 0.3
+        elif cpu_util < 0.1:
+            r_eff = -0.5
+        else:
+            r_eff = -0.3
+
+        if pods_ready_ratio < 1.0 and action != ScalingAction.STAY:
+            r_stab = -1.0
+        elif action == ScalingAction.SCALE_UP:
+            r_stab = -0.2
+        elif action == ScalingAction.SCALE_DOWN:
+            r_stab = -0.1
+        else:
+            r_stab = 0.1
+
+        reward = (self.w_sla * r_sla + self.w_eff * r_eff + self.w_stab * r_stab)
+        return float(max(-2.0, min(2.0, reward)))
+
+
+# =============================================================================
+# SECTION 8: MAPE-K CONTROLLER
+# =============================================================================
+
+@dataclass
+class PendingScale:
+    start_time: float
+    prev_state: Tuple[int, int, int]
+    prev_action: ScalingAction
+    target_replicas: int
+
 
 class MAPEKController:
-    """
-    MAPE-K (Monitor-Analyze-Plan-Execute-Knowledge) Controller
-    
-    Implements the CAPA+ autoscaling strategy with:
-    - Shadow/Hybrid/Active modes for safe RL training
-    - Double Q-Learning with anti-overfitting measures
-    - Proper reward function following Jain's principles
-    - Little's Law for proactive scaling hints
-    """
-    
-    def __init__(
-        self,
-        mode: ControlMode = ControlMode.SHADOW,
-        namespace: str = 'default',
-        dry_run: bool = False,
-        rl_authority: float = 0.0
-    ):
+    def __init__(self, config: Config = CONFIG, mode: ControlMode = ControlMode.SHADOW, dry_run: bool = False):
+        self.config = config
         self.mode = mode
-        self.rl_authority = rl_authority  # For hybrid mode (0-1)
-        
-        # Components
-        self.metrics_collector = MetricsCollector()
-        self.scaling_executor = ScalingExecutor(namespace, dry_run)
-        self.baseline_hpa = BaselineHPAController()
-        self.reward_calculator = RewardCalculator()
-        self.littles_law = LittleLawPredictor()
-        
-        # RL Agents (one per service)
-        self.rl_agents: Dict[str, DoubleQLearningAgent] = {}
-        for service in SERVICE_CONFIGS:
-            self.rl_agents[service] = DoubleQLearningAgent(service_name=service)
-        
-        # State tracking
-        self.previous_states: Dict[str, Tuple] = {}
-        self.previous_actions: Dict[str, int] = {}
+        self.dry_run = dry_run
+
+        self.logger = logging.getLogger('MAPE-K')
+
+        self.metrics = UnifiedMetricsCollector(config)
+        self.little_law = LittleLawValidator(config)
+        self.baseline = BaselineHPAController(config)
+        self.reward_calc = RewardCalculator()
+        self.kubectl = KubectlMetricsCollector(config.namespace)
+
+        self.agents: Dict[str, DoubleQLearningAgent] = {
+            svc: DoubleQLearningAgent(svc, config) for svc in config.services.keys()
+        }
+
+        # PATCH: learning policy by mode (SHADOW: disabled)
+        self.learning_enabled = False
+        self.rl_authority = 0.0
+        self.set_mode(mode)
+
+        self.previous_states: Dict[str, Tuple[int, int, int]] = {}
+        self.previous_actions: Dict[str, ScalingAction] = {}
         self.previous_metrics: Dict[str, ServiceMetrics] = {}
-        
-        # History
-        self.decisions_history: List[ScalingDecision] = []
+
+        self.pending_scale: Dict[str, PendingScale] = {}
+
+        self.last_scale_time: Dict[str, float] = {}
+        self.cooldown_sec = config.cooldown_sec
+
+        self.decision_history: List[ScalingDecision] = []
         self.metrics_history: List[Dict] = []
-        
-        # Control flags
-        self.running = False
-        self.learning_enabled = True
-        
-        logger.info(f"MAPEKController initialized in {mode.value} mode")
-    
-    def set_mode(self, mode: ControlMode, rl_authority: float = 0.5):
-        """Change controller mode"""
+
+        self.shadow_stats = {'agreements': 0, 'disagreements': 0}
+
+    def set_mode(self, mode: ControlMode, rl_authority: float = None):
         self.mode = mode
-        self.rl_authority = rl_authority
-        logger.info(f"Mode changed to {mode.value} (RL authority: {rl_authority:.0%})")
-    
-    def set_learning(self, enabled: bool):
-        """Enable/disable learning"""
-        self.learning_enabled = enabled
-        logger.info(f"Learning {'enabled' if enabled else 'disabled'}")
-    
-    # -------------------------------------------------------------------------
-    # MAPE-K Phases
-    # -------------------------------------------------------------------------
-    
-    def monitor(self) -> Dict[str, ServiceMetrics]:
-        """MONITOR phase: Collect metrics from all services"""
-        return self.metrics_collector.collect_all_metrics()
-    
-    def analyze(self, metrics: Dict[str, ServiceMetrics]) -> Dict[str, Dict]:
-        """ANALYZE phase: Convert metrics to states and scores"""
-        analysis = {}
-        
-        for service, m in metrics.items():
-            config = SERVICE_CONFIGS[service]
-            
-            # Calculate scores (normalized to target)
-            latency_score = m.latency_p95_ms / config['target_latency_ms']
-            cpu_score = m.cpu_util / (config['target_cpu'] / 100.0)
-            pod_ratio = m.pods_ready / config['max']
-            ready_ratio = m.pods_ready / max(1, m.pods_desired)
-            
-            # Get RL state
-            state = self.rl_agents[service].get_state(
-                cpu_util=m.cpu_util,
-                latency_score=latency_score,
-                pod_ratio=pod_ratio
-            )
-            
-            # Little's Law prediction
-            littles_optimal = self.littles_law.estimate_optimal_pods(
-                service,
-                m.request_rate,
-                config['target_latency_ms'] / 1000.0
-            )
-            
-            analysis[service] = {
-                'state': state,
-                'latency_score': latency_score,
-                'cpu_score': cpu_score,
-                'pod_ratio': pod_ratio,
-                'ready_ratio': ready_ratio,
-                'littles_optimal': littles_optimal,
-                'metrics': m
-            }
-        
-        return analysis
-    
-    def plan(self, analysis: Dict[str, Dict]) -> Dict[str, ScalingDecision]:
-        """PLAN phase: Decide scaling actions"""
-        decisions = {}
-        
-        for service, a in analysis.items():
-            m = a['metrics']
-            state = a['state']
-            
-            # Get RL agent's decision
-            rl_action = self.rl_agents[service].choose_action(
-                state, 
-                training=self.learning_enabled
-            )
-            
-            # Get baseline HPA decision
-            baseline_metrics = {
-                'cpu_util': m.cpu_util,
-                'pods_ready': m.pods_ready
-            }
-            baseline_action = self.baseline_hpa.decide(service, baseline_metrics)
-            
-            # Determine actual action based on mode
-            if self.mode == ControlMode.SHADOW:
-                actual_action = baseline_action
-                decision_source = 'baseline'
-            elif self.mode == ControlMode.ACTIVE:
-                actual_action = rl_action
-                decision_source = 'rl'
-            else:  # HYBRID
-                if np.random.random() < self.rl_authority:
-                    actual_action = rl_action
-                    decision_source = 'rl'
-                else:
-                    actual_action = baseline_action
-                    decision_source = 'baseline'
-            
-            decisions[service] = ScalingDecision(
-                timestamp=time.time(),
-                service=service,
-                state=state,
-                rl_action=rl_action,
-                baseline_action=baseline_action,
-                actual_action=actual_action,
-                decision_source=decision_source,
-                metrics_before={
-                    'cpu_util': m.cpu_util,
-                    'latency_p95_ms': m.latency_p95_ms,
-                    'latency_score': a['latency_score'],
-                    'pods_ready': m.pods_ready,
-                    'pods_desired': m.pods_desired,
-                    'request_rate': m.request_rate
-                }
-            )
-        
+        if mode == ControlMode.SHADOW:
+            self.rl_authority = 0.0
+            self.learning_enabled = False  # PATCH: avoid off-policy learning
+        elif mode == ControlMode.ACTIVE:
+            self.rl_authority = 1.0
+            self.learning_enabled = True
+        elif mode == ControlMode.EVALUATION:
+            self.rl_authority = 1.0
+            self.learning_enabled = False
+        elif mode == ControlMode.HYBRID:
+            self.rl_authority = float(rl_authority if rl_authority is not None else 0.5)
+            self.learning_enabled = True
+
+        self.logger.info(f"Mode: {mode.value}, RL authority: {self.rl_authority:.0%}, Learning: {self.learning_enabled}")
+
+    def control_loop_iteration(self) -> Dict[str, ScalingDecision]:
+        decisions: Dict[str, ScalingDecision] = {}
+        for service, svc_config in self.config.services.items():
+            try:
+                d = self._process_service(service, svc_config)
+                if d:
+                    decisions[service] = d
+            except Exception as e:
+                self.logger.error(f"Error processing {service}: {e}")
         return decisions
-    
-    def execute(self, decisions: Dict[str, ScalingDecision]) -> Dict[str, bool]:
-        """EXECUTE phase: Apply scaling decisions"""
-        results = {}
-        
-        for service, decision in decisions.items():
-            m = decision.metrics_before
-            executed = self.scaling_executor.scale(
-                service,
-                decision.actual_action,
-                m['pods_ready']
-            )
-            results[service] = executed
-            
-            # Store for learning
-            self.previous_states[service] = decision.state
-            self.previous_actions[service] = decision.actual_action
-        
-        return results
-    
-    def knowledge(self, decisions: Dict[str, ScalingDecision], 
-                  current_metrics: Dict[str, ServiceMetrics]):
-        """KNOWLEDGE phase: Learn from outcomes"""
+
+    def _process_service(self, service: str, svc_config: ServiceConfig) -> Optional[ScalingDecision]:
+        # MONITOR
+        metrics = self.metrics.collect(service)
+        self.metrics_history.append({'timestamp': time.time(), 'service': service, **asdict(metrics)})
+
+        # ANALYZE
+        system_state = self.little_law.validate(service, metrics, svc_config.capacity_per_pod)
+        latency_ratio = (metrics.latency_avg_ms / svc_config.target_latency_ms) if metrics.latency_avg_ms > 0 else 0.0
+        pod_ratio = (metrics.ready_replicas / svc_config.max_replicas) if svc_config.max_replicas > 0 else 0.0
+
+        state = self.agents[service].discretize_state(metrics.cpu_utilization, latency_ratio, pod_ratio)
+
+        # PLAN
+        rl_action = self.agents[service].choose_action(state, training=self.learning_enabled)
+        baseline_action = self.baseline.decide(service, metrics.cpu_utilization, metrics.ready_replicas)
+        actual_action, decision_source = self._select_action(rl_action, baseline_action)
+
+        if rl_action == baseline_action:
+            self.shadow_stats['agreements'] += 1
+        else:
+            self.shadow_stats['disagreements'] += 1
+
+        if not self._can_scale(service, actual_action):
+            actual_action = ScalingAction.STAY
+
+        # EXECUTE (and register pending settle)
+        if actual_action != ScalingAction.STAY:
+            new_replicas = self._compute_new_replicas(actual_action, metrics.ready_replicas, svc_config)
+            executed = self._execute_scaling(service, metrics.ready_replicas, new_replicas)
+            if executed:
+                # PATCH: register pending scaling for delayed reward
+                self.pending_scale[service] = PendingScale(
+                    start_time=time.time(),
+                    prev_state=self.previous_states.get(service, state),
+                    prev_action=actual_action,
+                    target_replicas=new_replicas
+                )
+
+        # KNOWLEDGE: delayed update logic
+        self._maybe_update_learning(service, svc_config, metrics, state, latency_ratio)
+
+        # Store for next iteration (state and action actually applied)
+        self.previous_states[service] = state
+        self.previous_actions[service] = actual_action
+        self.previous_metrics[service] = metrics
+
+        decision = ScalingDecision(
+            timestamp=time.time(),
+            service=service,
+            state=state,
+            rl_action=rl_action,
+            baseline_action=baseline_action,
+            actual_action=actual_action,
+            decision_source=decision_source,
+            metrics_snapshot=asdict(metrics),
+            system_state=asdict(system_state)
+        )
+        self.decision_history.append(decision)
+        self._log_decision(service, state, rl_action, baseline_action, actual_action, system_state, metrics)
+        return decision
+
+    def _select_action(self, rl_action: ScalingAction, baseline_action: ScalingAction) -> Tuple[ScalingAction, str]:
+        if self.mode == ControlMode.SHADOW:
+            return baseline_action, 'baseline'
+        if self.mode in (ControlMode.ACTIVE, ControlMode.EVALUATION):
+            return rl_action, 'rl'
+        if self.mode == ControlMode.HYBRID:
+            return (rl_action, 'rl') if random.random() < self.rl_authority else (baseline_action, 'baseline')
+        return baseline_action, 'baseline'
+
+    def _can_scale(self, service: str, action: ScalingAction) -> bool:
+        if action == ScalingAction.STAY:
+            return True
+        last = self.last_scale_time.get(service, 0.0)
+        return (time.time() - last) >= self.cooldown_sec
+
+    def _compute_new_replicas(self, action: ScalingAction, current_pods: int, cfg: ServiceConfig) -> int:
+        if action == ScalingAction.SCALE_UP:
+            return min(current_pods + 1, cfg.max_replicas)
+        if action == ScalingAction.SCALE_DOWN:
+            return max(current_pods - 1, cfg.min_replicas)
+        return current_pods
+
+    def _execute_scaling(self, service: str, current_pods: int, new_replicas: int) -> bool:
+        if new_replicas == current_pods:
+            return False
+
+        if self.dry_run:
+            self.logger.info(f"[DRY-RUN] Would scale {service}: {current_pods} -> {new_replicas}")
+            self.last_scale_time[service] = time.time()
+            return True
+
+        ok = self.kubectl.scale_deployment(service, new_replicas)
+        if ok:
+            self.logger.info(f"Scaled {service}: {current_pods} -> {new_replicas}")
+            self.last_scale_time[service] = time.time()
+            return True
+
+        self.logger.error(f"Failed to scale {service}")
+        return False
+
+    def _is_settled(self, metrics: ServiceMetrics, target_replicas: int) -> bool:
+        tol = int(self.config.readiness_tolerance)
+        return metrics.ready_replicas >= (target_replicas - tol)
+
+    def _maybe_update_learning(self, service: str, svc_config: ServiceConfig, metrics: ServiceMetrics,
+                              current_state: Tuple[int, int, int], latency_ratio: float):
         if not self.learning_enabled:
             return
-        
-        for service, decision in decisions.items():
-            if service not in self.previous_states:
-                continue
-            
-            prev_state = self.previous_states[service]
-            action = self.previous_actions[service]
-            m = current_metrics[service]
-            config = SERVICE_CONFIGS[service]
-            
-            # Calculate reward
-            latency_score = m.latency_p95_ms / config['target_latency_ms']
-            reward = self.reward_calculator.calculate(
-                service=service,
-                latency_score=latency_score,
-                cpu_util=m.cpu_util,
-                pods=m.pods_desired,
-                ready_pods=m.pods_ready,
-                action_taken=action
-            )
-            
-            # Get current state
-            curr_state = self.rl_agents[service].get_state(
-                cpu_util=m.cpu_util,
-                latency_score=latency_score,
-                pod_ratio=m.pods_ready / config['max']
-            )
-            
-            # Learn
-            self.rl_agents[service].learn(prev_state, action, reward, curr_state)
-            
-            # Update decision with reward
-            decision.reward = reward
-        
-        # Decay epsilon for all agents
-        for agent in self.rl_agents.values():
-            agent.decay_epsilon()
-        
-        # Store history
-        for decision in decisions.values():
-            self.decisions_history.append(decision)
-    
-    # -------------------------------------------------------------------------
-    # Main Control Loop
-    # -------------------------------------------------------------------------
-    
-    def control_loop_iteration(self) -> Dict[str, ScalingDecision]:
-        """Single iteration of the MAPE-K control loop"""
-        
-        # MONITOR
-        current_metrics = self.monitor()
-        
-        # Store metrics history
-        self.metrics_history.append({
-            'timestamp': time.time(),
-            'metrics': {svc: asdict(m) for svc, m in current_metrics.items()}
-        })
-        
-        # KNOWLEDGE (learn from previous iteration)
-        if self.previous_metrics:
-            # Use current metrics to evaluate previous decisions
-            pass  # Learning happens after execution
-        
-        # ANALYZE
-        analysis = self.analyze(current_metrics)
-        
-        # PLAN
-        decisions = self.plan(analysis)
-        
-        # EXECUTE
-        self.execute(decisions)
-        
-        # KNOWLEDGE (learn from this iteration's outcome)
-        if self.previous_metrics:
-            self.knowledge(
-                {svc: self.decisions_history[-len(decisions) + i] 
-                 for i, svc in enumerate(decisions.keys()) 
-                 if len(self.decisions_history) > i},
-                current_metrics
-            )
-        
-        # Store for next iteration
-        self.previous_metrics = current_metrics
-        
-        return decisions
-    
-    def run(self, duration_sec: int = 300, interval_sec: int = 10):
-        """Run control loop for specified duration"""
-        self.running = True
-        start_time = time.time()
-        iteration = 0
-        
-        logger.info(f"Starting control loop for {duration_sec}s with {interval_sec}s interval")
-        
-        while self.running and (time.time() - start_time) < duration_sec:
-            iteration += 1
-            iter_start = time.time()
-            
-            try:
-                decisions = self.control_loop_iteration()
-                
-                # Log summary
-                for svc, d in decisions.items():
-                    action_name = ScalingAction(d.actual_action).name
-                    logger.debug(
-                        f"[{svc}] State={d.state} Action={action_name} "
-                        f"(RL={ScalingAction(d.rl_action).name}, "
-                        f"Baseline={ScalingAction(d.baseline_action).name})"
-                    )
-            except Exception as e:
-                logger.error(f"Control loop error: {e}")
-            
-            # Wait for next iteration
-            elapsed = time.time() - iter_start
-            sleep_time = max(0, interval_sec - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-        
-        self.running = False
-        logger.info(f"Control loop completed. {iteration} iterations.")
-    
-    def stop(self):
-        """Stop the control loop"""
-        self.running = False
-    
-    # -------------------------------------------------------------------------
-    # Analysis and Reporting
-    # -------------------------------------------------------------------------
-    
-    def get_shadow_analysis(self) -> Dict:
-        """Get Shadow Mode analysis"""
-        analyzer = ShadowModeAnalyzer(self.decisions_history)
-        ready, analysis = analyzer.ready_for_active_mode()
-        return analysis
-    
-    def get_agent_stats(self) -> Dict[str, Dict]:
-        """Get statistics for all RL agents"""
-        return {svc: agent.get_stats() for svc, agent in self.rl_agents.items()}
-    
-    def save_state(self, directory: str):
-        """Save controller state to directory"""
-        os.makedirs(directory, exist_ok=True)
-        
-        # Save agents
-        for service, agent in self.rl_agents.items():
-            agent.save(os.path.join(directory, f'{service}_agent.json'))
-        
-        # Save history
-        with open(os.path.join(directory, 'decisions_history.json'), 'w') as f:
-            json.dump(
-                [asdict(d) if hasattr(d, '__dataclass_fields__') else d.__dict__ 
-                 for d in self.decisions_history],
-                f, indent=2, default=str
-            )
-        
-        with open(os.path.join(directory, 'metrics_history.json'), 'w') as f:
-            json.dump(self.metrics_history, f, indent=2, default=str)
-        
-        logger.info(f"State saved to {directory}")
-    
-    def load_state(self, directory: str):
-        """Load controller state from directory"""
-        for service, agent in self.rl_agents.items():
-            agent_file = os.path.join(directory, f'{service}_agent.json')
-            if os.path.exists(agent_file):
-                agent.load(agent_file)
-        
-        logger.info(f"State loaded from {directory}")
 
+        # If we have a pending scale, wait until settled or timeout
+        if service in self.pending_scale:
+            pend = self.pending_scale[service]
+            elapsed = time.time() - pend.start_time
+            settled = self._is_settled(metrics, pend.target_replicas)
+            timed_out = elapsed >= self.config.scaling_settle_timeout_sec
 
-# =============================================================================
-# EXPERIMENT RUNNER
-# =============================================================================
+            if not (settled or timed_out):
+                return  # skip update until we can attribute outcome
 
-class ExperimentRunner:
-    """
-    Runs experiments with proper train/test split
-    
-    Following Jain Ch. 16 experimental design principles
-    """
-    
-    def __init__(self, controller: MAPEKController):
-        self.controller = controller
-        self.train_results: List[ExperimentResult] = []
-        self.test_results: List[ExperimentResult] = []
-    
-    def get_load_pattern(self, pattern_name: str) -> List[int]:
-        """Get load pattern by name"""
-        if pattern_name == 'random':
-            # Generate random pattern
-            pattern = [50]
-            for _ in range(7):
-                delta = np.random.randint(-200, 300)
-                next_val = max(50, min(1000, pattern[-1] + delta))
-                pattern.append(next_val)
-            return pattern
-        return LOAD_PATTERNS[pattern_name]
-    
-    def run_experiment(
-        self,
-        pattern_name: str,
-        phase_duration_sec: int = 60,
-        is_training: bool = True
-    ) -> ExperimentResult:
-        """
-        Run single experiment with a load pattern
-        
-        Args:
-            pattern_name: Name of load pattern
-            phase_duration_sec: Duration of each load phase
-            is_training: If True, enable learning
-        """
-        pattern = self.get_load_pattern(pattern_name)
-        
-        # Configure controller
-        self.controller.set_learning(is_training)
-        if not is_training:
-            # Disable exploration during testing
-            for agent in self.controller.rl_agents.values():
-                agent.epsilon = 0.0
-        
-        result = ExperimentResult(
-            pattern_name=pattern_name,
-            mode=self.controller.mode.value,
-            start_time=time.time(),
-            end_time=0.0
-        )
-        
-        logger.info(f"Starting experiment: {pattern_name} ({'train' if is_training else 'test'})")
-        logger.info(f"Load pattern: {pattern}")
-        
-        # Run through load phases
-        for phase_idx, load_level in enumerate(pattern):
-            logger.info(f"Phase {phase_idx + 1}/{len(pattern)}: {load_level} users")
-            
-            # In real deployment, this would adjust Locust load
-            # Here we simulate by running the control loop
-            phase_start = time.time()
-            
-            while (time.time() - phase_start) < phase_duration_sec:
-                try:
-                    decisions = self.controller.control_loop_iteration()
-                    
-                    # Record metrics
-                    for svc, d in decisions.items():
-                        result.metrics_history.append({
-                            'timestamp': time.time(),
-                            'phase': phase_idx,
-                            'load_level': load_level,
-                            'service': svc,
-                            **d.metrics_before
-                        })
-                        result.decisions_history.append(asdict(d))
-                except Exception as e:
-                    logger.error(f"Experiment error: {e}")
-                
-                time.sleep(10)  # Control loop interval
-        
-        result.end_time = time.time()
-        
-        # Calculate summary statistics
-        if result.metrics_history:
-            latencies = [m.get('latency_p95_ms', 0) for m in result.metrics_history]
-            cpus = [m.get('cpu_util', 0) for m in result.metrics_history]
-            pods = [m.get('pods_ready', 1) for m in result.metrics_history]
-            
-            result.avg_latency_ms = np.mean(latencies) if latencies else 0
-            result.p95_latency_ms = np.percentile(latencies, 95) if latencies else 0
-            result.p99_latency_ms = np.percentile(latencies, 99) if latencies else 0
-            result.avg_cpu_util = np.mean(cpus) if cpus else 0
-            result.avg_pods = np.mean(pods) if pods else 0
-            result.total_scaling_actions = sum(
-                1 for d in result.decisions_history 
-                if d.get('actual_action') != ScalingAction.STAY.value
+            # Now compute reward and update using pend.prev_state/action -> current_state
+            reward = self.reward_calc.calculate(
+                latency_ratio=latency_ratio,
+                cpu_util=metrics.cpu_utilization,
+                action=pend.prev_action,
+                pods_ready_ratio=(metrics.ready_replicas / max(1, metrics.current_replicas))
             )
-        
-        # Store result
-        if is_training:
-            self.train_results.append(result)
-        else:
-            self.test_results.append(result)
-        
-        logger.info(f"Experiment complete: P95={result.p95_latency_ms:.1f}ms, "
-                   f"Avg pods={result.avg_pods:.1f}")
-        
-        return result
-    
-    def run_training_pipeline(
-        self,
-        epochs: int = 3,
-        phase_duration_sec: int = 60
-    ):
-        """
-        Run full training pipeline with Shadow → Hybrid → Active progression
-        """
-        logger.info("="*60)
-        logger.info("PHASE 1: SHADOW MODE TRAINING")
-        logger.info("="*60)
-        
-        self.controller.set_mode(ControlMode.SHADOW)
-        
-        for epoch in range(epochs):
-            pattern = TRAIN_PATTERNS[epoch % len(TRAIN_PATTERNS)]
-            logger.info(f"\nEpoch {epoch + 1}/{epochs}: {pattern} pattern")
-            self.run_experiment(pattern, phase_duration_sec, is_training=True)
-        
-        # Check readiness
-        analysis = self.controller.get_shadow_analysis()
-        logger.info(f"\nShadow Mode Analysis:")
-        logger.info(f"  Observations: {analysis['observations']}")
-        logger.info(f"  Agreement rate: {analysis['agreement_rate']:.1%}")
-        
-        if not analysis['ready']:
-            logger.warning("Not ready for active mode. Continue shadow training.")
+            self.agents[service].update(pend.prev_state, pend.prev_action, reward, current_state)
+            self.agents[service].replay()
+
+            del self.pending_scale[service]
             return
-        
-        logger.info("\n" + "="*60)
-        logger.info("PHASE 2: HYBRID MODE")
-        logger.info("="*60)
-        
-        for authority in [0.25, 0.50, 0.75]:
-            self.controller.set_mode(ControlMode.HYBRID, rl_authority=authority)
-            pattern = TRAIN_PATTERNS[0]
-            logger.info(f"\nRL authority: {authority:.0%}")
-            result = self.run_experiment(pattern, phase_duration_sec, is_training=True)
-            
-            # Safety check
-            if result.p95_latency_ms > 1000:  # 1 second threshold
-                logger.warning(f"High latency detected. Reducing authority.")
-                break
-        
-        logger.info("\n" + "="*60)
-        logger.info("PHASE 3: ACTIVE MODE TRAINING")
-        logger.info("="*60)
-        
-        self.controller.set_mode(ControlMode.ACTIVE)
-        
-        for pattern in TRAIN_PATTERNS:
-            logger.info(f"\nActive training: {pattern}")
-            self.run_experiment(pattern, phase_duration_sec, is_training=True)
-        
-        logger.info("\n" + "="*60)
-        logger.info("PHASE 4: EVALUATION (held-out patterns)")
-        logger.info("="*60)
-        
-        for pattern in TEST_PATTERNS:
-            logger.info(f"\nTesting on UNSEEN pattern: {pattern}")
-            self.run_experiment(pattern, phase_duration_sec, is_training=False)
-        
-        # Final analysis
-        self.check_overfitting()
-    
-    def check_overfitting(self) -> float:
-        """
-        Check for overfitting by comparing train vs test performance
-        
-        From Jain: If test >> train, model is overfitting
-        """
-        if not self.train_results or not self.test_results:
-            logger.warning("Insufficient data for overfitting check")
-            return 0.0
-        
-        train_p95 = np.mean([r.p95_latency_ms for r in self.train_results])
-        test_p95 = np.mean([r.p95_latency_ms for r in self.test_results])
-        
-        ratio = test_p95 / max(train_p95, 0.001)
-        
-        logger.info("\n" + "="*60)
-        logger.info("OVERFITTING ANALYSIS")
-        logger.info("="*60)
-        logger.info(f"Training P95 (seen patterns):   {train_p95:.1f} ms")
-        logger.info(f"Testing P95 (unseen patterns):  {test_p95:.1f} ms")
-        logger.info(f"Generalization ratio:           {ratio:.2f}")
-        
-        if ratio > 1.5:
-            logger.warning("❌ OVERFITTING DETECTED: Test 50%+ worse than training")
-        elif ratio > 1.2:
-            logger.warning("⚠️ MILD OVERFITTING: Test 20%+ worse than training")
-        else:
-            logger.info("✓ GOOD GENERALIZATION: Test similar to training")
-        
-        return ratio
-    
-    def save_results(self, directory: str):
-        """Save experiment results"""
+
+        # No pending scale; safe to do one-step update if we have previous state
+        if service in self.previous_states and service in self.previous_actions:
+            prev_state = self.previous_states[service]
+            prev_action = self.previous_actions[service]
+            reward = self.reward_calc.calculate(
+                latency_ratio=latency_ratio,
+                cpu_util=metrics.cpu_utilization,
+                action=prev_action,
+                pods_ready_ratio=(metrics.ready_replicas / max(1, metrics.current_replicas))
+            )
+            self.agents[service].update(prev_state, prev_action, reward, current_state)
+            self.agents[service].replay()
+
+    def _log_decision(self, service: str, state: Tuple[int, int, int], rl: ScalingAction, baseline: ScalingAction,
+                      actual: ScalingAction, sys_state: SystemState, metrics: ServiceMetrics):
+        stable_mark = "OK" if sys_state.is_stable else "UNSTABLE"
+        self.logger.info(
+            f"[{service}] S={state} Act={actual.name} "
+            f"(RL={rl.name} Base={baseline.name}) "
+            f"rho={sys_state.utilization:.1%} {stable_mark} "
+            f"P95={metrics.latency_p95_ms:.0f}ms CPU={metrics.cpu_utilization:.1%} Pods={metrics.ready_replicas}"
+        )
+
+    def get_shadow_analysis(self) -> Dict:
+        total = self.shadow_stats['agreements'] + self.shadow_stats['disagreements']
+        if total == 0:
+            return {'agreement_rate': 0.0, 'total_decisions': 0}
+        return {
+            'agreement_rate': self.shadow_stats['agreements'] / total,
+            'total_decisions': total,
+            'agreements': self.shadow_stats['agreements'],
+            'disagreements': self.shadow_stats['disagreements']
+        }
+
+    def save_state(self, directory: str):
         os.makedirs(directory, exist_ok=True)
-        
-        with open(os.path.join(directory, 'train_results.json'), 'w') as f:
-            json.dump([asdict(r) for r in self.train_results], f, indent=2, default=str)
-        
-        with open(os.path.join(directory, 'test_results.json'), 'w') as f:
-            json.dump([asdict(r) for r in self.test_results], f, indent=2, default=str)
-        
-        logger.info(f"Results saved to {directory}")
+
+        for service, agent in self.agents.items():
+            agent.save(os.path.join(directory, f"{service}_agent.json"))
+
+        with open(os.path.join(directory, "shadow_stats.json"), 'w') as f:
+            json.dump(self.shadow_stats, f, indent=2)
+
+        decisions_data = []
+        for d in self.decision_history[-1000:]:
+            dd = asdict(d)
+            dd['state'] = _state_to_key(d.state)
+            dd['rl_action'] = d.rl_action.name
+            dd['baseline_action'] = d.baseline_action.name
+            dd['actual_action'] = d.actual_action.name
+            decisions_data.append(dd)
+
+        with open(os.path.join(directory, "decision_history.json"), 'w') as f:
+            json.dump(decisions_data, f, indent=2)
+
+        with open(os.path.join(directory, "metrics_history.json"), 'w') as f:
+            json.dump(self.metrics_history[-5000:], f, indent=2)
+
+        self.logger.info(f"State saved to {directory}")
+
+    def load_state(self, directory: str):
+        for service, agent in self.agents.items():
+            path = os.path.join(directory, f"{service}_agent.json")
+            if os.path.exists(path):
+                agent.load(path)
+
+        shadow_path = os.path.join(directory, "shadow_stats.json")
+        if os.path.exists(shadow_path):
+            with open(shadow_path, 'r') as f:
+                self.shadow_stats = json.load(f)
+
+        self.logger.info(f"State loaded from {directory}")
 
 
 # =============================================================================
-# MAIN
+# SECTION 9: LOCUST MANAGER
+# =============================================================================
+
+class LocustManager:
+    def __init__(self, locust_url: str = "http://localhost:8089"):
+        self.url = locust_url
+        self.logger = logging.getLogger('LocustMgr')
+
+    def is_running(self) -> bool:
+        try:
+            r = requests.get(f"{self.url}/stats/requests", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def set_users(self, count: int, spawn_rate: int = None) -> bool:
+        if spawn_rate is None:
+            spawn_rate = max(1, count // 10)
+        try:
+            r = requests.post(
+                f"{self.url}/swarm",
+                data={'user_count': count, 'spawn_rate': spawn_rate},
+                timeout=5
+            )
+            return r.status_code == 200
+        except Exception as e:
+            self.logger.error(f"Failed to set users: {e}")
+            return False
+
+    def stop(self) -> bool:
+        try:
+            r = requests.get(f"{self.url}/stop", timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def reset_stats(self) -> bool:
+        try:
+            r = requests.get(f"{self.url}/stats/reset", timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+# =============================================================================
+# SECTION 10: TRAINING ORCHESTRATOR
+# =============================================================================
+
+class TrainingOrchestrator:
+    def __init__(self, config: Config = CONFIG, checkpoint_dir: str = "./checkpoints", dry_run: bool = False):
+        self.config = config
+        self.checkpoint_dir = checkpoint_dir
+        self.dry_run = dry_run
+
+        self.controller = MAPEKController(config, ControlMode.SHADOW, dry_run)
+        self.locust = LocustManager(config.locust_url)
+        self.logger = logging.getLogger('Training')
+
+        self.running = False
+        self.training_state = TrainingState()
+        self.results: List[Dict] = []
+
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        self.logger.info("Shutdown signal received, saving checkpoint...")
+        self.running = False
+        self.save_checkpoint()
+
+    def save_checkpoint(self, label: str = None):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if label:
+            path = os.path.join(self.checkpoint_dir, f"checkpoint_{label}_{timestamp}")
+        else:
+            path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch{self.training_state.epoch}_{timestamp}")
+
+        os.makedirs(path, exist_ok=True)
+        self.controller.save_state(path)
+
+        state_data = {
+            'phase': self.training_state.phase.value,
+            'epoch': self.training_state.epoch,
+            'total_iterations': self.training_state.total_iterations,
+            'rl_authority': self.training_state.rl_authority,
+            'results': self.results[-100:]
+        }
+        with open(os.path.join(path, "training_state.json"), 'w') as f:
+            json.dump(state_data, f, indent=2)
+
+        self.training_state.last_checkpoint_time = time.time()
+        self.logger.info(f"Checkpoint saved: {path}")
+
+    def load_checkpoint(self, path: str):
+        self.controller.load_state(path)
+        state_file = os.path.join(path, "training_state.json")
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                data = json.load(f)
+            self.training_state.phase = TrainingPhase(data.get('phase', 'shadow'))
+            self.training_state.epoch = int(data.get('epoch', 0))
+            self.training_state.total_iterations = int(data.get('total_iterations', 0))
+            self.training_state.rl_authority = float(data.get('rl_authority', 0.0))
+
+        self.logger.info(f"Loaded checkpoint: epoch={self.training_state.epoch}, phase={self.training_state.phase.value}")
+
+    def run_pattern(self, pattern_name: str, duration_sec: float) -> Dict:
+        if pattern_name == 'random':
+            pattern = [50 + random.randint(-30, 400) for _ in range(8)]
+        else:
+            pattern = LOAD_PATTERNS.get(pattern_name, [100, 200, 300, 200, 100])
+
+        step_duration = duration_sec / len(pattern)
+        pattern_metrics = []
+
+        self.logger.info(f"Running pattern: {pattern_name} ({len(pattern)} steps, {step_duration:.0f}s each)")
+
+        for step_idx, users in enumerate(pattern):
+            if not self.running:
+                break
+
+            if self.locust.is_running():
+                self.locust.set_users(users)
+
+            step_start = time.time()
+            while self.running and (time.time() - step_start) < step_duration:
+                decisions = self.controller.control_loop_iteration()
+                self.training_state.total_iterations += 1
+
+                for svc, d in decisions.items():
+                    pattern_metrics.append({
+                        'timestamp': time.time(),
+                        'pattern': pattern_name,
+                        'step': step_idx,
+                        'users': users,
+                        'service': svc,
+                        'latency_p95': d.metrics_snapshot.get('latency_p95_ms', 0),
+                        'cpu': d.metrics_snapshot.get('cpu_utilization', 0),
+                        'action': d.actual_action.name
+                    })
+
+                time.sleep(self.config.control_interval_sec)
+
+            self.training_state.epoch += 1
+
+        if pattern_metrics:
+            latencies = [m['latency_p95'] for m in pattern_metrics if m['latency_p95'] > 0]
+            return {
+                'pattern': pattern_name,
+                'phase': self.training_state.phase.value,
+                'samples': len(pattern_metrics),
+                'latency_p95_mean': float(np.mean(latencies)) if latencies else 0.0,
+                'latency_p95_max': float(np.max(latencies)) if latencies else 0.0,
+                'latency_p95_std': float(np.std(latencies)) if latencies else 0.0
+            }
+
+        return {'pattern': pattern_name, 'samples': 0}
+
+    def run_phase(self, phase: TrainingPhase, duration_sec: float, patterns: List[str],
+                  rl_authority: float = 0.0, learning: bool = True) -> List[Dict]:
+        self.training_state.phase = phase
+        self.training_state.rl_authority = rl_authority
+
+        if phase == TrainingPhase.SHADOW:
+            self.controller.set_mode(ControlMode.SHADOW)
+        elif phase in (TrainingPhase.HYBRID_25, TrainingPhase.HYBRID_50, TrainingPhase.HYBRID_75):
+            self.controller.set_mode(ControlMode.HYBRID, rl_authority)
+        elif phase == TrainingPhase.ACTIVE:
+            self.controller.set_mode(ControlMode.ACTIVE)
+        elif phase == TrainingPhase.EVALUATION:
+            self.controller.set_mode(ControlMode.EVALUATION)
+
+        # Respect explicit learning flag (though SHADOW will override to False)
+        if self.controller.mode != ControlMode.SHADOW:
+            self.controller.learning_enabled = bool(learning)
+
+        phase_results = []
+        pattern_duration = duration_sec / max(1, len(patterns))
+
+        self.logger.info(f"PHASE: {phase.value.upper()} Duration: {duration_sec/3600:.2f}h Patterns: {patterns}")
+        self.logger.info(f"RL Authority: {rl_authority:.0%} Learning: {self.controller.learning_enabled}")
+
+        for pattern_name in patterns:
+            if not self.running:
+                break
+            result = self.run_pattern(pattern_name, pattern_duration)
+            phase_results.append(result)
+            self.results.append(result)
+            self.logger.info(f"Pattern {pattern_name}: P95={result.get('latency_p95_mean', 0):.1f}ms")
+
+        return phase_results
+
+    def run_full_training(self, total_duration_hours: float = 8.0,
+                          shadow_fraction: float = 0.30, hybrid_fraction: float = 0.25,
+                          active_fraction: float = 0.25, eval_fraction: float = 0.20):
+        self.running = True
+        self.training_state.start_time = time.time()
+        total_sec = total_duration_hours * 3600.0
+
+        try:
+            self.run_phase(TrainingPhase.SHADOW, total_sec * shadow_fraction,
+                           ['warmup'] + self.config.train_patterns * 3,
+                           rl_authority=0.0, learning=False)
+            self.save_checkpoint("shadow_complete")
+            if not self.running:
+                return
+
+            for authority, phase in [(0.25, TrainingPhase.HYBRID_25),
+                                     (0.50, TrainingPhase.HYBRID_50),
+                                     (0.75, TrainingPhase.HYBRID_75)]:
+                if not self.running:
+                    break
+                self.run_phase(phase, total_sec * hybrid_fraction / 3.0,
+                               self.config.train_patterns, rl_authority=authority, learning=True)
+            self.save_checkpoint("hybrid_complete")
+            if not self.running:
+                return
+
+            self.run_phase(TrainingPhase.ACTIVE, total_sec * active_fraction,
+                           self.config.train_patterns * 3, rl_authority=1.0, learning=True)
+            self.save_checkpoint("active_complete")
+            if not self.running:
+                return
+
+            self.run_phase(TrainingPhase.EVALUATION, total_sec * eval_fraction,
+                           self.config.test_patterns * 3, rl_authority=1.0, learning=False)
+
+            self.training_state.phase = TrainingPhase.COMPLETED
+            self.save_checkpoint("final")
+
+        except Exception as e:
+            self.logger.error(f"Training error: {e}")
+            self.save_checkpoint("error")
+            raise
+        finally:
+            self.running = False
+
+
+# =============================================================================
+# SECTION 11: DIAGNOSTICS
+# =============================================================================
+
+def run_diagnostics(config: Config):
+    print("\n" + "="*60)
+    print("CAPA+ SYSTEM DIAGNOSTICS")
+    print("="*60)
+
+    print("\n--- Prometheus ---")
+    prom = PrometheusMetricsCollector(config.prometheus_url, config.namespace)
+    if prom.is_available():
+        print(f"Connected to {config.prometheus_url}")
+        has_latency, source = prom.has_latency_metrics()
+        print(f"Latency metrics: {'YES' if has_latency else 'NO'} ({source})")
+    else:
+        print(f"Cannot connect to {config.prometheus_url}")
+
+    print("\n--- Locust ---")
+    locust = LocustMetricsCollector(config.locust_url)
+    if locust.is_available():
+        print(f"Connected to {config.locust_url}")
+        stats = locust.get_aggregate_latency()
+        print(f"RPS: {stats.get('rps', 0):.1f} P50: {stats.get('p50_ms', 0):.1f}ms P95: {stats.get('p95_ms', 0):.1f}ms")
+    else:
+        print(f"Cannot connect to {config.locust_url}")
+
+    print("\n--- Kubernetes ---")
+    try:
+        result = subprocess.run(['kubectl', 'get', 'nodes', '-o', 'wide'],
+                               capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print("kubectl connected")
+            print(result.stdout)
+        else:
+            print("kubectl error")
+            print(result.stderr)
+    except Exception as e:
+        print(f"Kubernetes error: {e}")
+
+    print(f"\n--- Deployments in '{config.namespace}' ---")
+    try:
+        result = subprocess.run(['kubectl', 'get', 'deployments', '-n', config.namespace],
+                               capture_output=True, text=True, timeout=10)
+        print(result.stdout if result.returncode == 0 else result.stderr)
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+# =============================================================================
+# SECTION 12: CLI
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='CAPA+ MAPE-K Controller')
-    parser.add_argument('--mode', choices=['shadow', 'hybrid', 'active'], 
-                       default='shadow', help='Control mode')
-    parser.add_argument('--dry-run', action='store_true', 
-                       help='Dry run (no actual scaling)')
-    parser.add_argument('--duration', type=int, default=300,
-                       help='Duration in seconds')
-    parser.add_argument('--interval', type=int, default=10,
-                       help='Control loop interval in seconds')
-    parser.add_argument('--train', action='store_true',
-                       help='Run full training pipeline')
-    parser.add_argument('--load-state', type=str,
-                       help='Load state from directory')
-    parser.add_argument('--save-state', type=str,
-                       help='Save state to directory')
-    parser.add_argument('--namespace', type=str, default='default',
-                       help='Kubernetes namespace')
-    
-    args = parser.parse_args()
-    
-    # Create controller
-    mode_map = {
-        'shadow': ControlMode.SHADOW,
-        'hybrid': ControlMode.HYBRID,
-        'active': ControlMode.ACTIVE
-    }
-    
-    controller = MAPEKController(
-        mode=mode_map[args.mode],
-        namespace=args.namespace,
-        dry_run=args.dry_run
+    parser = argparse.ArgumentParser(
+        description='CAPA+ Unified Experiment Framework (Patched)',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
-    # Load previous state if specified
-    if args.load_state:
-        controller.load_state(args.load_state)
-    
-    # Handle graceful shutdown
-    def signal_handler(signum, frame):
-        logger.info("Received shutdown signal")
-        controller.stop()
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        if args.train:
-            # Run full training pipeline
-            runner = ExperimentRunner(controller)
-            runner.run_training_pipeline(epochs=3, phase_duration_sec=60)
-            
-            if args.save_state:
-                runner.save_results(args.save_state)
-                controller.save_state(args.save_state)
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--prometheus', default='http://localhost:9090', help='Prometheus URL')
+    common.add_argument('--locust', default='http://localhost:8089', help='Locust URL')
+    common.add_argument('--namespace', '-n', default='default', help='Kubernetes namespace')
+
+    subparsers.add_parser('diagnose', parents=[common], help='Run diagnostics')
+
+    val_parser = subparsers.add_parser('validate', parents=[common], help='Validate Little\'s Law (projection)')
+    val_parser.add_argument('--continuous', '-c', action='store_true', help='Run continuously')
+    val_parser.add_argument('--service', '-s', default='frontend', help='Service to validate')
+    val_parser.add_argument('--interval', type=int, default=5, help='Interval in seconds')
+
+    train_parser = subparsers.add_parser('train', parents=[common], help='Run training')
+    train_parser.add_argument('--mode', choices=['shadow', 'hybrid', 'active', 'full'],
+                              default='shadow', help='Training mode')
+    train_parser.add_argument('--duration', type=int, default=3600, help='Duration in seconds')
+    train_parser.add_argument('--dry-run', action='store_true', help='Simulate scaling')
+    train_parser.add_argument('--checkpoint-dir', default='./checkpoints', help='Checkpoint directory')
+    train_parser.add_argument('--resume', type=str, help='Resume from checkpoint path')
+
+    analyze_parser = subparsers.add_parser('analyze', parents=[common], help='Analyze results')
+    analyze_parser.add_argument('--data-dir', default='./checkpoints', help='Data directory')
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    CONFIG.prometheus_url = args.prometheus
+    CONFIG.locust_url = args.locust
+    CONFIG.namespace = args.namespace
+
+    if args.command == 'diagnose':
+        run_diagnostics(CONFIG)
+        return
+
+    if args.command == 'validate':
+        validator = LittleLawValidator(CONFIG)
+        collector = UnifiedMetricsCollector(CONFIG)
+
+        if args.continuous:
+            print("Press Ctrl+C to stop\n")
+            try:
+                while True:
+                    metrics = collector.collect(args.service)
+                    svc_config = CONFIG.services.get(args.service)
+                    capacity = svc_config.capacity_per_pod if svc_config else 100
+                    state = validator.validate(args.service, metrics, capacity)
+                    steady, reason = validator._check_steady_state(args.service)
+                    status = "STABLE" if state.is_stable else "UNSTABLE"
+
+                    print(f"\n--- {datetime.now().strftime('%H:%M:%S')} ---")
+                    print(f"Status: {status}")
+                    print(f"lambda (arrival): {state.arrival_rate:.1f} req/s")
+                    print(f"T (response):     {state.response_time_avg_sec*1000:.1f} ms")
+                    print(f"N = lambda*T:     {state.predicted_queue_length:.1f}")
+                    print(f"rho (util):       {state.utilization:.1%}")
+                    print(f"Pods (c):         {state.num_servers}")
+                    print(f"Steady-state:     {reason}")
+                    time.sleep(args.interval)
+            except KeyboardInterrupt:
+                print("\nStopped.")
         else:
-            # Run single control loop
-            controller.run(duration_sec=args.duration, interval_sec=args.interval)
-            
-            if args.save_state:
-                controller.save_state(args.save_state)
-    
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
-    finally:
-        # Print final statistics
-        stats = controller.get_agent_stats()
-        for svc, s in stats.items():
-            logger.info(f"[{svc}] Final ε={s['epsilon']:.3f}, "
-                       f"updates={s['total_updates']}, "
-                       f"states={s['states_discovered']}")
+            metrics = collector.collect(args.service)
+            state = validator.validate(args.service, metrics, 100)
+            print(json.dumps(asdict(state), indent=2, default=str))
+        return
+
+    if args.command == 'train':
+        orchestrator = TrainingOrchestrator(CONFIG, checkpoint_dir=args.checkpoint_dir, dry_run=args.dry_run)
+        if args.resume:
+            orchestrator.load_checkpoint(args.resume)
+
+        if args.mode == 'full':
+            orchestrator.run_full_training(args.duration / 3600.0)
+            return
+
+        # PATCH: correct mapping for non-full modes
+        mode_to_phase = {
+            'shadow': TrainingPhase.SHADOW,
+            'hybrid': TrainingPhase.HYBRID_50,
+            'active': TrainingPhase.ACTIVE,
+        }
+        mode_to_ctrl = {
+            'shadow': (ControlMode.SHADOW, 0.0, False),
+            'hybrid': (ControlMode.HYBRID, 0.5, True),
+            'active': (ControlMode.ACTIVE, 1.0, True),
+        }
+
+        phase = mode_to_phase[args.mode]
+        ctrl_mode, authority, learning = mode_to_ctrl[args.mode]
+
+        orchestrator.running = True
+        # set controller mode explicitly
+        orchestrator.controller.set_mode(ctrl_mode, authority)
+
+        patterns = (CONFIG.train_patterns * 3) if args.mode != 'shadow' else (['warmup'] + CONFIG.train_patterns * 3)
+        orchestrator.run_phase(phase, float(args.duration), patterns, rl_authority=authority, learning=learning)
+        orchestrator.running = False
+        return
+
+    if args.command == 'analyze':
+        print(f"Analyzing results from: {args.data_dir}")
+        checkpoints = sorted(Path(args.data_dir).glob("checkpoint_*"))
+        if not checkpoints:
+            print("No checkpoints found")
+            return
+        latest = checkpoints[-1]
+        print(f"Latest checkpoint: {latest}")
+
+        state_file = latest / "training_state.json"
+        if state_file.exists():
+            with open(state_file) as f:
+                data = json.load(f)
+            print(f"\nPhase: {data.get('phase')}")
+            print(f"Epoch: {data.get('epoch')}")
+            print(f"Iterations: {data.get('total_iterations')}")
+            results = data.get('results', [])
+            if results:
+                print(f"\nResults ({len(results)} patterns):")
+                for r in results[-10:]:
+                    print(f"  {r.get('pattern')}: P95={r.get('latency_p95_mean', 0):.1f}ms")
 
 
 if __name__ == '__main__':
