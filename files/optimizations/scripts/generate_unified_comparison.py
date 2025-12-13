@@ -1,84 +1,127 @@
 #!/usr/bin/env python3
 """
-Academic Analysis Script for CAPA+ Autoscaler Evaluation
+generate_unified_comparison.py
+========================================================
+Unified Academic + Rigorous Statistical Analysis for CAPA+ Experiments
 
-This script implements proper statistical analysis methods from:
-- Jain (1991): The Art of Computer Systems Performance Analysis
-- Harchol-Balter (2013): Performance Modeling and Design of Computer Systems
-- INTROD_1: Introduction to Computer System Performance Evaluation
+This module consolidates and corrects:
+- statistical_analysis (rigorous CI, batch means, transient removal, paired comparison)
+- generate_academic_analysis (full report, plots, overfitting, shadow mode)
 
-Key Features:
-- Correct mean selection (arithmetic, geometric, harmonic) following Jain Ch. 12
-- Statistical significance testing (paired t-test, confidence intervals)
-- Overfitting detection via train/test comparison
-- Shadow mode analysis
-- Comprehensive visualization
-- Academic-quality reporting
+Primary references:
+- Jain (1991): The Art of Computer Systems Performance Analysis (Ch. 11-13, 25, 27)
+- INTROD_1: Confidence intervals, steady-state and measurement basics
+- Harchol-Balter (2013): Performance Modeling & Design of Computer Systems (supporting context)
+
+Key guarantees:
+1) Confidence Intervals computed correctly (t or z as appropriate)
+2) Batch Means for autocorrelated observations (Jain 25.5.2) + autocov validity check
+3) Transient Removal (Jain 25.3) with selectable heuristic
+4) Paired Comparison (Jain 13.4.1) on paired observations + CI on mean difference
+5) Correct mean selection (Jain Ch. 12): arithmetic/geometric/harmonic + weighted CPU utilization
+6) Sample size adequacy / precision checking (Jain 13.9)
+7) Academic-quality reporting + plots (matplotlib only)
 
 Author: EECS6446 Cloud Computing Project
-Date: November 2025
+Date: December 2025
 """
 
 import os
 import sys
+import math
 import json
 import argparse
+import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
-import warnings
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.stats import gmean, hmean, ttest_rel, ttest_ind, sem, shapiro
 
-# Plotting imports
+# Plotting (matplotlib only; avoid seaborn dependency)
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.gridspec import GridSpec
-import seaborn as sns
-
-# Set style
-plt.style.use('seaborn-v0_8-whitegrid')
-sns.set_palette("husl")
-
-# Suppress warnings
-warnings.filterwarnings('ignore')
 
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# SLA thresholds
 SLA_THRESHOLDS = {
-    'frontend': {'latency_ms': 200, 'cpu_target': 0.5},
-    'recommendationservice': {'latency_ms': 100, 'cpu_target': 0.5},
-    'productcatalogservice': {'latency_ms': 100, 'cpu_target': 0.5},
-    'cartservice': {'latency_ms': 100, 'cpu_target': 0.5},
-    'checkoutservice': {'latency_ms': 150, 'cpu_target': 0.5},
+    "frontend": {"latency_ms": 200, "cpu_target": 0.5},
+    "recommendationservice": {"latency_ms": 100, "cpu_target": 0.5},
+    "productcatalogservice": {"latency_ms": 100, "cpu_target": 0.5},
+    "cartservice": {"latency_ms": 100, "cpu_target": 0.5},
+    "checkoutservice": {"latency_ms": 150, "cpu_target": 0.5},
 }
 
-# Colors for plots
+# Keep colors stable but do not rely on seaborn
 COLORS = {
-    'baseline': '#2ecc71',  # Green
-    'capa': '#3498db',      # Blue
-    'shadow': '#9b59b6',    # Purple
-    'hybrid': '#f39c12',    # Orange
-    'active': '#e74c3c',    # Red
+    "baseline": "#2ecc71",
+    "capa": "#3498db",
+    "shadow": "#9b59b6",
+    "warning": "#e74c3c",
+    "neutral": "#95a5a6",
 }
 
 
 # =============================================================================
-# DATA CLASSES
+# DATA STRUCTURES
 # =============================================================================
 
 @dataclass
+class ConfidenceInterval:
+    mean: float
+    std: float
+    ci_lower: float
+    ci_upper: float
+    ci_width: float
+    confidence_level: float
+    sample_size: int
+    method: str
+
+    def includes_zero(self) -> bool:
+        return self.ci_lower <= 0 <= self.ci_upper
+
+    def __str__(self) -> str:
+        half = self.ci_width / 2
+        return (
+            f"{self.mean:.3f} ± {half:.3f} "
+            f"({self.confidence_level*100:.0f}% CI: [{self.ci_lower:.3f}, {self.ci_upper:.3f}])"
+        )
+
+
+@dataclass
+class BatchMeansResult:
+    overall_mean: float
+    batch_means: List[float]
+    batch_size: int
+    num_batches: int
+    variance_of_batch_means: float
+    autocovariance_lag1: float
+    ci: ConfidenceInterval
+    is_valid: bool
+    warning: Optional[str] = None
+
+
+@dataclass
+class PairedComparisonResult:
+    system_a_name: str
+    system_b_name: str
+    mean_difference: float  # A - B
+    std_difference: float
+    ci: ConfidenceInterval
+    is_significant: bool
+    t_statistic: float
+    p_value: float
+    n_pairs: int
+
+
+@dataclass
 class ComparisonResult:
-    """Results of comparing two systems"""
     metric_name: str
     baseline_value: float
     capa_value: float
@@ -88,17 +131,297 @@ class ComparisonResult:
     significant: bool
     confidence_interval: Optional[Tuple[float, float]]
     effect_size: Optional[float]
+    metadata: Dict[str, Any]
 
 
 @dataclass
 class OverfittingAnalysis:
-    """Overfitting detection results"""
     train_p95: float
     test_p95: float
     generalization_ratio: float
     is_overfitting: bool
-    severity: str  # 'none', 'mild', 'severe'
+    severity: str
     recommendations: List[str]
+
+
+@dataclass
+class SteadyStateAnalysis:
+    is_steady_state: bool
+    transient_length: int
+    reason: str
+    arrival_rate_cv: float
+    response_time_cv: float
+    utilization_trend: float
+
+
+# =============================================================================
+# CORE STATISTICAL UTILITIES (Jain Ch. 13)
+# =============================================================================
+
+def compute_confidence_interval(
+    data: List[float],
+    confidence: float = 0.95,
+    method: str = "naive"
+) -> ConfidenceInterval:
+    """
+    CI for mean: x̄ ± t_{1-α/2; n-1} * (s/√n) (Jain 13.2)
+    Uses z for large n (>=30) as a practical convention.
+    Assumes IID unless otherwise stated.
+    """
+    n = len(data)
+    if n == 0:
+        return ConfidenceInterval(0.0, 0.0, 0.0, 0.0, 0.0, confidence, 0, method)
+    if n < 2:
+        x = float(data[0])
+        return ConfidenceInterval(x, 0.0, x, x, 0.0, confidence, n, method)
+
+    x_bar = float(np.mean(data))
+    s = float(np.std(data, ddof=1))
+
+    alpha = 1.0 - confidence
+    if n >= 30:
+        z = float(stats.norm.ppf(1 - alpha / 2))
+        half_width = z * s / math.sqrt(n)
+    else:
+        t_val = float(stats.t.ppf(1 - alpha / 2, df=n - 1))
+        half_width = t_val * s / math.sqrt(n)
+
+    return ConfidenceInterval(
+        mean=x_bar,
+        std=s,
+        ci_lower=x_bar - half_width,
+        ci_upper=x_bar + half_width,
+        ci_width=2 * half_width,
+        confidence_level=confidence,
+        sample_size=n,
+        method=method
+    )
+
+
+# =============================================================================
+# BATCH MEANS (Jain 25.5.2 + note on autocovariance vs covariance)
+# =============================================================================
+
+def batch_means_analysis(
+    data: List[float],
+    confidence: float = 0.95,
+    initial_batch_size: int = 10,
+    max_iterations: int = 10,
+    min_batches: int = 5,
+    autocov_threshold_ratio: float = 0.10
+) -> BatchMeansResult:
+    """
+    Batch means CI for autocorrelated observations (Jain 25.5.2).
+    We iteratively increase batch size until lag-1 autocovariance of batch means
+    is small relative to variance of batch means.
+    """
+    N = len(data)
+    if N < 20:
+        ci = compute_confidence_interval(data, confidence, method="naive_smallN")
+        return BatchMeansResult(
+            overall_mean=ci.mean,
+            batch_means=[ci.mean],
+            batch_size=N,
+            num_batches=1,
+            variance_of_batch_means=ci.std ** 2,
+            autocovariance_lag1=0.0,
+            ci=ci,
+            is_valid=False,
+            warning="Batch means needs N>=20; used naive CI."
+        )
+
+    batch_size = max(2, int(initial_batch_size))
+    best: Optional[BatchMeansResult] = None
+
+    for _ in range(max_iterations):
+        m = N // batch_size
+        if m < min_batches:
+            break
+
+        # batch means
+        bmeans = [
+            float(np.mean(data[i * batch_size:(i + 1) * batch_size]))
+            for i in range(m)
+        ]
+
+        overall_mean = float(np.mean(bmeans))
+        var_bm = float(np.var(bmeans, ddof=1)) if m > 1 else 0.0
+
+        # Jain 27.3 autocovariance at lag 1:
+        # R1 = (1/(m-1)) * sum_{i=1..m-1} (x_i - x̄)(x_{i+1} - x̄)
+        if m >= 2:
+            acov = sum(
+                (bmeans[i] - overall_mean) * (bmeans[i + 1] - overall_mean)
+                for i in range(m - 1)
+            ) / (m - 1)
+        else:
+            acov = 0.0
+
+        # CI based on batch means treated as approximately independent
+        alpha = 1.0 - confidence
+        t_val = float(stats.t.ppf(1 - alpha / 2, df=m - 1))
+        std_of_mean = math.sqrt(var_bm / m) if m > 0 else 0.0
+        half_width = t_val * std_of_mean
+
+        ci = ConfidenceInterval(
+            mean=overall_mean,
+            std=math.sqrt(var_bm) if var_bm >= 0 else 0.0,
+            ci_lower=overall_mean - half_width,
+            ci_upper=overall_mean + half_width,
+            ci_width=2 * half_width,
+            confidence_level=confidence,
+            sample_size=N,
+            method=f"batch_means(n={batch_size}, m={m})"
+        )
+
+        is_valid = True
+        if var_bm > 0:
+            is_valid = abs(acov) < (autocov_threshold_ratio * var_bm)
+
+        res = BatchMeansResult(
+            overall_mean=overall_mean,
+            batch_means=bmeans,
+            batch_size=batch_size,
+            num_batches=m,
+            variance_of_batch_means=var_bm,
+            autocovariance_lag1=acov,
+            ci=ci,
+            is_valid=is_valid,
+            warning=None
+        )
+        best = res
+
+        if is_valid:
+            return res
+
+        batch_size *= 2
+
+    if best is not None:
+        best.warning = "Autocovariance still significant; returned best available batch size."
+        return best
+
+    ci = compute_confidence_interval(data, confidence, method="naive_fallback")
+    return BatchMeansResult(
+        overall_mean=ci.mean,
+        batch_means=[ci.mean],
+        batch_size=N,
+        num_batches=1,
+        variance_of_batch_means=ci.std ** 2,
+        autocovariance_lag1=0.0,
+        ci=ci,
+        is_valid=False,
+        warning="Fallback to naive CI."
+    )
+
+
+# =============================================================================
+# TRANSIENT REMOVAL (Jain 25.3)
+# =============================================================================
+
+def detect_transient_period(data: List[float], method: str = "batch_variance") -> int:
+    """
+    Heuristic transient detection. For serious studies, you would usually
+    also plot moving averages / use domain-specific warm-up logic.
+    """
+    N = len(data)
+    if N == 0:
+        return 0
+
+    if method == "rule_of_thumb":
+        return int(0.10 * N)
+
+    if method == "moving_average":
+        window = max(5, N // 20)
+        ma = np.convolve(np.asarray(data), np.ones(window) / window, mode="valid")
+        deriv = np.abs(np.diff(ma))
+        thresh = float(np.median(deriv) * 0.5) if len(deriv) else 0.0
+        for i, d in enumerate(deriv):
+            if d < thresh:
+                return i + window
+        return int(0.10 * N)
+
+    # batch_variance (Jain 25.3.6 heuristic)
+    min_bs = max(2, N // 50)
+    max_bs = max(min_bs, N // 5)
+
+    variances = []
+    batch_sizes = []
+    for bs in range(min_bs, max_bs + 1, min_bs):
+        m = N // bs
+        if m < 3:
+            break
+        bmeans = [np.mean(data[i * bs:(i + 1) * bs]) for i in range(m)]
+        variances.append(float(np.var(bmeans, ddof=1)))
+        batch_sizes.append(bs)
+
+    if not variances:
+        return int(0.10 * N)
+
+    peak = int(np.argmax(variances))
+    return int(batch_sizes[peak]) if peak > 0 else int(0.10 * N)
+
+
+def remove_transient(
+    data: List[float],
+    transient_length: Optional[int] = None,
+    method: str = "batch_variance"
+) -> Tuple[List[float], int]:
+    if transient_length is None:
+        transient_length = detect_transient_period(data, method=method)
+    transient_length = max(0, min(transient_length, len(data)))
+    return data[transient_length:], transient_length
+
+
+# =============================================================================
+# PAIRED COMPARISON (Jain 13.4.1)
+# =============================================================================
+
+def paired_comparison(
+    system_a: List[float],
+    system_b: List[float],
+    system_a_name: str = "System A",
+    system_b_name: str = "System B",
+    confidence: float = 0.95
+) -> PairedComparisonResult:
+    if len(system_a) != len(system_b):
+        raise ValueError(f"Paired comparison requires equal sizes: {len(system_a)} vs {len(system_b)}")
+    n = len(system_a)
+    if n < 2:
+        raise ValueError("Need at least 2 paired observations.")
+
+    diffs = np.asarray(system_a, dtype=float) - np.asarray(system_b, dtype=float)
+    d_bar = float(np.mean(diffs))
+    s_d = float(np.std(diffs, ddof=1))
+
+    t_stat = d_bar / (s_d / math.sqrt(n)) if s_d > 0 else 0.0
+    p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+
+    alpha = 1 - confidence
+    t_crit = float(stats.t.ppf(1 - alpha / 2, df=n - 1))
+    half_width = t_crit * s_d / math.sqrt(n)
+
+    ci = ConfidenceInterval(
+        mean=d_bar,
+        std=s_d,
+        ci_lower=d_bar - half_width,
+        ci_upper=d_bar + half_width,
+        ci_width=2 * half_width,
+        confidence_level=confidence,
+        sample_size=n,
+        method="paired_comparison"
+    )
+
+    return PairedComparisonResult(
+        system_a_name=system_a_name,
+        system_b_name=system_b_name,
+        mean_difference=d_bar,
+        std_difference=s_d,
+        ci=ci,
+        is_significant=not ci.includes_zero(),
+        t_statistic=t_stat,
+        p_value=p_val,
+        n_pairs=n
+    )
 
 
 # =============================================================================
@@ -106,415 +429,390 @@ class OverfittingAnalysis:
 # =============================================================================
 
 class MeanCalculator:
-    """
-    Correct mean selection following Jain Chapter 12
-    
-    Rules:
-    - Arithmetic mean: When sum has physical meaning (times, counts)
-    - Geometric mean: For ratios and normalized values
-    - Harmonic mean: For rates (throughput, bandwidth)
-    
-    From Jain Example 12.3: CPU utilization MUST be weighted by duration!
-    """
-    
     @staticmethod
     def arithmetic_mean(values: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
-        """
-        Arithmetic mean for additive quantities
-        
-        From Jain Ch. 12.5: Use when sum has physical meaning
-        Example: Response times, queue lengths
-        """
+        if len(values) == 0:
+            return 0.0
         if weights is not None:
-            return np.average(values, weights=weights)
-        return np.mean(values)
-    
+            w = np.asarray(weights, dtype=float)
+            if np.sum(w) == 0:
+                return float(np.mean(values))
+            return float(np.average(values, weights=w))
+        return float(np.mean(values))
+
     @staticmethod
     def geometric_mean(values: np.ndarray) -> float:
-        """
-        Geometric mean for ratios and normalized values
-        
-        From Jain Ch. 12.5 and Case Study 12.1:
-        - Use for speedup ratios
-        - Use for normalized performance metrics
-        - Handles ratio games (Ch. 11)
-        """
-        # Filter out non-positive values
-        positive_values = values[values > 0]
-        if len(positive_values) == 0:
+        v = np.asarray(values, dtype=float)
+        v = v[v > 0]
+        if len(v) == 0:
             return 0.0
-        return float(gmean(positive_values))
-    
+        return float(np.exp(np.mean(np.log(v))))
+
     @staticmethod
     def harmonic_mean(values: np.ndarray) -> float:
-        """
-        Harmonic mean for rates
-        
-        From Jain Ch. 12.6:
-        - Use for throughput (requests/sec)
-        - Use for bandwidth (bytes/sec)
-        - Relationship: rate = 1/time
-        """
-        # Filter out zeros and negatives
-        positive_values = values[values > 0]
-        if len(positive_values) == 0:
+        v = np.asarray(values, dtype=float)
+        v = v[v > 0]
+        if len(v) == 0:
             return 0.0
-        return float(hmean(positive_values))
-    
+        return float(len(v) / np.sum(1.0 / v))
+
     @staticmethod
-    def weighted_cpu_utilization(
-        cpu_utils: np.ndarray, 
-        durations: np.ndarray
-    ) -> float:
-        """
-        Weighted CPU utilization following Jain Example 12.3
-        
-        CRITICAL: CPU utilization MUST be weighted by duration!
-        
-        From Jain lines 5489-5518:
-        "The CPU utilizations should be combined using weighted average
-        with weights equal to the duration of each period."
-        
-        Formula: U_avg = Σ(U_i × T_i) / Σ(T_i)
-        """
-        if len(cpu_utils) == 0:
+    def weighted_cpu_utilization(cpu_utils: np.ndarray, durations: np.ndarray) -> float:
+        u = np.asarray(cpu_utils, dtype=float)
+        t = np.asarray(durations, dtype=float)
+        if len(u) == 0 or len(t) == 0:
             return 0.0
-        
-        total_busy_time = np.sum(cpu_utils * durations)
-        total_time = np.sum(durations)
-        
+        if len(u) != len(t):
+            # fallback: unweighted mean if durations mismatch
+            return float(np.mean(u))
+        total_time = float(np.sum(t))
         if total_time == 0:
             return 0.0
-        
-        return total_busy_time / total_time
-    
-    @staticmethod
-    def select_mean_type(metric_name: str) -> str:
-        """
-        Select appropriate mean type based on metric
-        
-        Following Jain Ch. 12 rules
-        """
-        metric_lower = metric_name.lower()
-        
-        # Rates -> Harmonic
-        if any(x in metric_lower for x in ['throughput', 'rate', 'bandwidth', 'rps']):
-            return 'harmonic'
-        
-        # Ratios -> Geometric
-        if any(x in metric_lower for x in ['ratio', 'speedup', 'normalized', 'improvement']):
-            return 'geometric'
-        
-        # Times, counts, utilization -> Arithmetic
-        return 'arithmetic'
+        return float(np.sum(u * t) / total_time)
 
 
 # =============================================================================
-# STATISTICAL TESTS (INTROD_1 Ch. 3)
+# EFFECT SIZE (Cohen's d)
 # =============================================================================
 
-class StatisticalTests:
+def cohens_d(baseline: np.ndarray, treatment: np.ndarray) -> float:
+    b = np.asarray(baseline, dtype=float)
+    t = np.asarray(treatment, dtype=float)
+    if len(b) < 2 or len(t) < 2:
+        return 0.0
+    var1 = float(np.var(b, ddof=1))
+    var2 = float(np.var(t, ddof=1))
+    n1, n2 = len(b), len(t)
+    pooled = math.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2)) if (n1 + n2 - 2) > 0 else 0.0
+    if pooled == 0:
+        return 0.0
+    return float((np.mean(b) - np.mean(t)) / pooled)
+
+
+# =============================================================================
+# SPEEDUP (Geometric mean in ratio space + CI in log space)
+# =============================================================================
+
+def compute_speedup_with_ci(
+    baseline_times: np.ndarray,
+    improved_times: np.ndarray,
+    confidence: float = 0.95
+) -> Tuple[float, ConfidenceInterval]:
+    b = np.asarray(baseline_times, dtype=float)
+    i = np.asarray(improved_times, dtype=float)
+    if len(b) != len(i):
+        raise ValueError("Speedup requires paired observations (same length).")
+    if len(b) < 2:
+        gm = float(b[0] / i[0]) if (len(b) == 1 and i[0] > 0) else 1.0
+        ci = ConfidenceInterval(gm, 0.0, gm, gm, 0.0, confidence, len(b), "speedup_smallN")
+        return gm, ci
+
+    # speedup = baseline / improved
+    speedups = np.where(i > 0, b / i, 1.0)
+    speedups = speedups[speedups > 0]
+    gm = float(np.exp(np.mean(np.log(speedups))))
+
+    log_s = np.log(speedups)
+    log_ci = compute_confidence_interval(list(log_s), confidence=confidence, method="log_speedup")
+    ci = ConfidenceInterval(
+        mean=gm,
+        std=float(np.exp(log_ci.std) - 1.0),
+        ci_lower=float(np.exp(log_ci.ci_lower)),
+        ci_upper=float(np.exp(log_ci.ci_upper)),
+        ci_width=float(np.exp(log_ci.ci_upper) - np.exp(log_ci.ci_lower)),
+        confidence_level=confidence,
+        sample_size=len(speedups),
+        method="geometric_mean_speedup"
+    )
+    return gm, ci
+
+
+# =============================================================================
+# SAMPLE SIZE ADEQUACY (Jain 13.9)
+# =============================================================================
+
+def check_precision(
+    data: np.ndarray,
+    desired_precision: float = 0.10,
+    confidence: float = 0.95,
+    assume_iid: bool = True
+) -> Tuple[bool, float, int]:
     """
-    Statistical significance testing following INTROD_1 Chapter 3
+    desired_precision is relative half-width: (CI_half_width / |mean|)
+    For autocorrelated series you should compute CI via batch means before using this.
+    Here we default to naive CI unless caller pre-processes.
     """
-    
-    @staticmethod
-    def paired_t_test(
-        baseline: np.ndarray, 
-        treatment: np.ndarray,
-        alpha: float = 0.05
-    ) -> Tuple[float, float, bool]:
-        """
-        Paired t-test for comparing two systems on same workload
-        
-        From INTROD_1 Section 3.3: Use paired test when same conditions
-        
-        Returns:
-            (t_statistic, p_value, is_significant)
-        """
-        if len(baseline) != len(treatment):
-            # Fall back to independent t-test
-            return StatisticalTests.independent_t_test(baseline, treatment, alpha)
-        
-        t_stat, p_value = ttest_rel(baseline, treatment)
-        return t_stat, p_value, p_value < alpha
-    
-    @staticmethod
-    def independent_t_test(
-        baseline: np.ndarray,
-        treatment: np.ndarray,
-        alpha: float = 0.05
-    ) -> Tuple[float, float, bool]:
-        """
-        Independent t-test for comparing two systems
-        
-        Returns:
-            (t_statistic, p_value, is_significant)
-        """
-        t_stat, p_value = ttest_ind(baseline, treatment)
-        return t_stat, p_value, p_value < alpha
-    
-    @staticmethod
-    def confidence_interval(
-        data: np.ndarray,
-        confidence: float = 0.95
-    ) -> Tuple[float, float, float]:
-        """
-        Calculate confidence interval
-        
-        From INTROD_1 Section 3.2
-        
-        Returns:
-            (mean, lower_bound, upper_bound)
-        """
-        n = len(data)
-        mean = np.mean(data)
-        se = sem(data)
-        
-        # t-critical value for given confidence
-        t_crit = stats.t.ppf((1 + confidence) / 2, n - 1)
-        margin = t_crit * se
-        
-        return mean, mean - margin, mean + margin
-    
-    @staticmethod
-    def effect_size_cohens_d(
-        baseline: np.ndarray,
-        treatment: np.ndarray
-    ) -> float:
-        """
-        Cohen's d effect size
-        
-        Interpretation:
-        - |d| < 0.2: negligible
-        - 0.2 ≤ |d| < 0.5: small
-        - 0.5 ≤ |d| < 0.8: medium
-        - |d| ≥ 0.8: large
-        """
-        n1, n2 = len(baseline), len(treatment)
-        var1, var2 = np.var(baseline, ddof=1), np.var(treatment, ddof=1)
-        
-        # Pooled standard deviation
-        pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
-        
-        if pooled_std == 0:
-            return 0.0
-        
-        return (np.mean(baseline) - np.mean(treatment)) / pooled_std
-    
-    @staticmethod
-    def check_normality(data: np.ndarray) -> Tuple[float, bool]:
-        """
-        Shapiro-Wilk test for normality
-        
-        Returns:
-            (p_value, is_normal)
-        """
-        if len(data) < 3:
-            return 1.0, True
-        
-        stat, p_value = shapiro(data[:5000])  # Limit for performance
-        return p_value, p_value > 0.05
+    x = np.asarray(data, dtype=float)
+    if len(x) < 2:
+        return False, float("inf"), 100
+
+    ci = compute_confidence_interval(list(x), confidence=confidence, method="naive_precision")
+    if ci.mean == 0:
+        return False, float("inf"), 100
+
+    current_precision = (ci.ci_width / 2) / abs(ci.mean)
+    ok = current_precision <= desired_precision
+    if ok:
+        return True, current_precision, 0
+
+    ratio = (current_precision / desired_precision) ** 2
+    additional = int(len(x) * (ratio - 1))
+    return False, current_precision, max(0, additional)
 
 
 # =============================================================================
-# SYSTEM COMPARISON (Jain Ch. 12.7)
+# STEADY-STATE CHECK (support utility)
+# =============================================================================
+
+def check_steady_state(
+    arrival_rates: List[float],
+    response_times: List[float],
+    utilizations: List[float],
+    cv_threshold: float = 0.30
+) -> SteadyStateAnalysis:
+    if len(arrival_rates) < 5 or len(response_times) < 5 or len(utilizations) < 5:
+        return SteadyStateAnalysis(
+            is_steady_state=False,
+            transient_length=0,
+            reason="Insufficient data (<5)",
+            arrival_rate_cv=0.0,
+            response_time_cv=0.0,
+            utilization_trend=0.0
+        )
+
+    arr = np.asarray(arrival_rates, dtype=float)
+    rsp = np.asarray(response_times, dtype=float)
+    utl = np.asarray(utilizations, dtype=float)
+
+    arr_mean = float(np.mean(arr))
+    rsp_mean = float(np.mean(rsp))
+
+    arr_cv = float(np.std(arr) / arr_mean) if arr_mean > 0 else float("inf")
+    rsp_cv = float(np.std(rsp) / rsp_mean) if rsp_mean > 0 else float("inf")
+
+    x = np.arange(len(utl))
+    slope, _, _, _, _ = stats.linregress(x, utl)
+
+    reasons = []
+    if arr_cv > cv_threshold:
+        reasons.append(f"Arrival CV={arr_cv:.2f} > {cv_threshold}")
+    if rsp_cv > (cv_threshold + 0.10):
+        reasons.append(f"Response CV={rsp_cv:.2f} too high")
+    if slope > 0.01:
+        reasons.append(f"Utilization trend slope={slope:.4f} > 0.01")
+
+    return SteadyStateAnalysis(
+        is_steady_state=(len(reasons) == 0),
+        transient_length=0,
+        reason="; ".join(reasons) if reasons else "Steady state plausible",
+        arrival_rate_cv=arr_cv,
+        response_time_cv=rsp_cv,
+        utilization_trend=float(slope)
+    )
+
+
+# =============================================================================
+# SYSTEM COMPARATOR (unified)
 # =============================================================================
 
 class SystemComparator:
-    """
-    Compare two systems following Jain Chapter 12 methodology
-    """
-    
-    def __init__(self):
+    def __init__(self, confidence: float = 0.95):
+        self.confidence = confidence
         self.mean_calc = MeanCalculator()
-        self.stats = StatisticalTests()
-    
+
     def compare_response_times(
         self,
         baseline_latencies: np.ndarray,
-        capa_latencies: np.ndarray
+        capa_latencies: np.ndarray,
+        use_batch_means_for_diff: bool = True
     ) -> ComparisonResult:
         """
-        Compare response times using ARITHMETIC mean
-        
-        From Jain Rule 1: Sum of response times has physical meaning
+        Response times are additive => arithmetic mean (Jain Ch. 12).
+        Statistical inference is best done on paired differences (Jain 13.4.1).
+        For autocorrelated data, CI for mean difference should use batch means.
         """
-        baseline_mean = self.mean_calc.arithmetic_mean(baseline_latencies)
-        capa_mean = self.mean_calc.arithmetic_mean(capa_latencies)
-        
-        improvement = ((baseline_mean - capa_mean) / baseline_mean) * 100 if baseline_mean > 0 else 0
-        
-        # Statistical significance
-        t_stat, p_value, significant = self.stats.paired_t_test(
-            baseline_latencies, capa_latencies
-        )
-        
-        # Confidence interval of difference
-        if len(baseline_latencies) == len(capa_latencies):
-            diff = baseline_latencies - capa_latencies
-            mean_diff, ci_low, ci_high = self.stats.confidence_interval(diff)
-            ci = (ci_low, ci_high)
-        else:
-            ci = None
-        
-        # Effect size
-        effect = self.stats.effect_size_cohens_d(baseline_latencies, capa_latencies)
-        
+        b = np.asarray(baseline_latencies, dtype=float)
+        c = np.asarray(capa_latencies, dtype=float)
+        n = min(len(b), len(c))
+        b = b[:n]
+        c = c[:n]
+
+        baseline_mean = self.mean_calc.arithmetic_mean(b)
+        capa_mean = self.mean_calc.arithmetic_mean(c)
+        improvement = ((baseline_mean - capa_mean) / baseline_mean) * 100 if baseline_mean > 0 else 0.0
+
+        # Paired t-test if paired, else independent
+        p_value = None
+        significant = False
+        if n >= 2:
+            if len(b) == len(c):
+                t_stat, p_value = stats.ttest_rel(b, c)
+                significant = bool(p_value < 0.05)
+            else:
+                t_stat, p_value = stats.ttest_ind(b, c)
+                significant = bool(p_value < 0.05)
+
+        # CI on difference (baseline - capa) so positive means CAPA+ improved
+        ci_tuple = None
+        meta: Dict[str, Any] = {}
+
+        if n >= 2 and len(b) == len(c):
+            diff = (b - c).tolist()
+
+            if use_batch_means_for_diff and len(diff) >= 20:
+                bm = batch_means_analysis(diff, confidence=self.confidence)
+                ci_tuple = (bm.ci.ci_lower, bm.ci.ci_upper)
+                meta["ci_method"] = "batch_means_on_diff"
+                meta["batch_size"] = bm.batch_size
+                meta["num_batches"] = bm.num_batches
+                meta["autocovariance_lag1"] = bm.autocovariance_lag1
+                meta["variance_of_batch_means"] = bm.variance_of_batch_means
+                meta["batch_valid"] = bm.is_valid
+                if bm.warning:
+                    meta["batch_warning"] = bm.warning
+            else:
+                ci = compute_confidence_interval(diff, confidence=self.confidence, method="naive_on_diff")
+                ci_tuple = (ci.ci_lower, ci.ci_upper)
+                meta["ci_method"] = "naive_on_diff"
+
+        effect = cohens_d(b, c)
+
         return ComparisonResult(
-            metric_name='Response Time (P95)',
-            baseline_value=baseline_mean,
-            capa_value=capa_mean,
-            improvement_pct=improvement,
-            mean_type='arithmetic',
-            p_value=p_value,
+            metric_name="Response Time (P95 sample mean)",
+            baseline_value=float(baseline_mean),
+            capa_value=float(capa_mean),
+            improvement_pct=float(improvement),
+            mean_type="arithmetic",
+            p_value=float(p_value) if p_value is not None else None,
             significant=significant,
-            confidence_interval=ci,
-            effect_size=effect
+            confidence_interval=ci_tuple,
+            effect_size=float(effect),
+            metadata=meta
         )
-    
-    def compare_throughput(
-        self,
-        baseline_throughput: np.ndarray,
-        capa_throughput: np.ndarray
-    ) -> ComparisonResult:
+
+    def compare_throughput(self, baseline_tp: np.ndarray, capa_tp: np.ndarray) -> ComparisonResult:
         """
-        Compare throughput using HARMONIC mean
-        
-        From Jain Ch. 12.6: Throughput is a rate (requests/sec)
+        Throughput is a rate => harmonic mean (Jain Ch. 12.6).
         """
-        # Replace zeros with small value to avoid division issues
-        baseline_clean = np.where(baseline_throughput > 0, baseline_throughput, 0.001)
-        capa_clean = np.where(capa_throughput > 0, capa_throughput, 0.001)
-        
-        baseline_mean = self.mean_calc.harmonic_mean(baseline_clean)
-        capa_mean = self.mean_calc.harmonic_mean(capa_clean)
-        
-        improvement = ((capa_mean - baseline_mean) / baseline_mean) * 100 if baseline_mean > 0 else 0
-        
-        t_stat, p_value, significant = self.stats.paired_t_test(
-            baseline_clean, capa_clean
-        )
-        
-        effect = self.stats.effect_size_cohens_d(baseline_clean, capa_clean)
-        
+        b = np.asarray(baseline_tp, dtype=float)
+        c = np.asarray(capa_tp, dtype=float)
+        n = min(len(b), len(c))
+        b = b[:n]
+        c = c[:n]
+
+        b = np.where(b > 0, b, 0.001)
+        c = np.where(c > 0, c, 0.001)
+
+        baseline_mean = self.mean_calc.harmonic_mean(b)
+        capa_mean = self.mean_calc.harmonic_mean(c)
+        improvement = ((capa_mean - baseline_mean) / baseline_mean) * 100 if baseline_mean > 0 else 0.0
+
+        p_value = None
+        significant = False
+        if n >= 2 and len(b) == len(c):
+            _, p_value = stats.ttest_rel(b, c)
+            significant = bool(p_value < 0.05)
+
+        effect = cohens_d(b, c)
+
         return ComparisonResult(
-            metric_name='Throughput',
-            baseline_value=baseline_mean,
-            capa_value=capa_mean,
-            improvement_pct=improvement,
-            mean_type='harmonic',
-            p_value=p_value,
+            metric_name="Throughput (RPS)",
+            baseline_value=float(baseline_mean),
+            capa_value=float(capa_mean),
+            improvement_pct=float(improvement),
+            mean_type="harmonic",
+            p_value=float(p_value) if p_value is not None else None,
             significant=significant,
             confidence_interval=None,
-            effect_size=effect
+            effect_size=float(effect),
+            metadata={}
         )
-    
-    def compare_speedup(
-        self,
-        baseline_latencies: np.ndarray,
-        capa_latencies: np.ndarray
-    ) -> ComparisonResult:
+
+    def compare_speedup(self, baseline_lat: np.ndarray, capa_lat: np.ndarray) -> ComparisonResult:
         """
-        Compare speedup ratios using GEOMETRIC mean
-        
-        From Jain Case Study 12.1: Geometric mean for program speedups
-        This avoids the "ratio games" problem from Chapter 11
+        Speedup ratio => geometric mean (Jain Ch. 12.5 + ratio games Ch. 11).
         """
-        # Calculate per-sample speedup ratios
-        capa_clean = np.where(capa_latencies > 0, capa_latencies, 0.001)
-        speedup_ratios = baseline_latencies / capa_clean
-        
-        # Geometric mean of ratios
-        geo_mean_speedup = self.mean_calc.geometric_mean(speedup_ratios)
-        
+        b = np.asarray(baseline_lat, dtype=float)
+        c = np.asarray(capa_lat, dtype=float)
+        n = min(len(b), len(c))
+        b = b[:n]
+        c = c[:n]
+
+        gm, ci = compute_speedup_with_ci(b, c, confidence=self.confidence)
+        # improvement_pct relative to 1.0
         return ComparisonResult(
-            metric_name='Speedup Ratio',
-            baseline_value=1.0,  # Reference
-            capa_value=geo_mean_speedup,
-            improvement_pct=(geo_mean_speedup - 1) * 100,
-            mean_type='geometric',
+            metric_name="Speedup (Baseline / CAPA+)",
+            baseline_value=1.0,
+            capa_value=float(gm),
+            improvement_pct=float((gm - 1.0) * 100.0),
+            mean_type="geometric",
             p_value=None,
-            significant=geo_mean_speedup > 1.0,
-            confidence_interval=None,
-            effect_size=None
+            significant=bool(ci.ci_lower > 1.0),
+            confidence_interval=(ci.ci_lower, ci.ci_upper),
+            effect_size=None,
+            metadata={"ci_method": ci.method}
         )
-    
+
     def compare_cpu_utilization(
         self,
         baseline_cpu: np.ndarray,
-        baseline_durations: np.ndarray,
+        baseline_dur: np.ndarray,
         capa_cpu: np.ndarray,
-        capa_durations: np.ndarray
+        capa_dur: np.ndarray
     ) -> ComparisonResult:
         """
-        Compare CPU utilization with WEIGHTED arithmetic mean
-        
-        From Jain Example 12.3: CPU utilization MUST be weighted by duration
+        CPU utilization must be weighted by duration (Jain Example 12.3).
         """
-        baseline_weighted = self.mean_calc.weighted_cpu_utilization(
-            baseline_cpu, baseline_durations
-        )
-        capa_weighted = self.mean_calc.weighted_cpu_utilization(
-            capa_cpu, capa_durations
-        )
-        
-        # For CPU, higher utilization (up to ~70%) is better (efficiency)
-        # But we report the raw difference
-        diff = capa_weighted - baseline_weighted
-        
+        b_u = np.asarray(baseline_cpu, dtype=float)
+        b_t = np.asarray(baseline_dur, dtype=float)
+        c_u = np.asarray(capa_cpu, dtype=float)
+        c_t = np.asarray(capa_dur, dtype=float)
+
+        baseline_w = self.mean_calc.weighted_cpu_utilization(b_u, b_t)
+        capa_w = self.mean_calc.weighted_cpu_utilization(c_u, c_t)
+        diff = capa_w - baseline_w
+
         return ComparisonResult(
-            metric_name='CPU Utilization (weighted)',
-            baseline_value=baseline_weighted,
-            capa_value=capa_weighted,
-            improvement_pct=diff * 100,  # Absolute difference
-            mean_type='weighted_arithmetic',
+            metric_name="CPU Utilization (weighted by duration)",
+            baseline_value=float(baseline_w),
+            capa_value=float(capa_w),
+            improvement_pct=float(diff * 100.0),  # absolute percentage points scaled
+            mean_type="weighted_arithmetic",
             p_value=None,
-            significant=abs(diff) > 0.1,
+            significant=bool(abs(diff) > 0.10),
             confidence_interval=None,
-            effect_size=None
+            effect_size=None,
+            metadata={"note": "Weighted by duration per Jain Ex. 12.3"}
         )
-    
-    def full_comparison(
-        self,
-        baseline_df: pd.DataFrame,
-        capa_df: pd.DataFrame
-    ) -> Dict[str, ComparisonResult]:
-        """
-        Comprehensive comparison of two systems
-        """
-        results = {}
-        
-        # Response Time
-        if 'p95_latency_ms' in baseline_df.columns:
-            results['response_time'] = self.compare_response_times(
-                baseline_df['p95_latency_ms'].values,
-                capa_df['p95_latency_ms'].values[:len(baseline_df)]
+
+    def full_comparison(self, baseline_df: pd.DataFrame, capa_df: pd.DataFrame) -> Dict[str, ComparisonResult]:
+        results: Dict[str, ComparisonResult] = {}
+
+        if "p95_latency_ms" in baseline_df.columns and "p95_latency_ms" in capa_df.columns:
+            results["response_time"] = self.compare_response_times(
+                baseline_df["p95_latency_ms"].values,
+                capa_df["p95_latency_ms"].values
             )
-        
-        # Throughput
-        if 'throughput_rps' in baseline_df.columns:
-            results['throughput'] = self.compare_throughput(
-                baseline_df['throughput_rps'].values,
-                capa_df['throughput_rps'].values[:len(baseline_df)]
+            results["speedup"] = self.compare_speedup(
+                baseline_df["p95_latency_ms"].values,
+                capa_df["p95_latency_ms"].values
             )
-        
-        # Speedup
-        if 'p95_latency_ms' in baseline_df.columns:
-            results['speedup'] = self.compare_speedup(
-                baseline_df['p95_latency_ms'].values,
-                capa_df['p95_latency_ms'].values[:len(baseline_df)]
+
+        if "throughput_rps" in baseline_df.columns and "throughput_rps" in capa_df.columns:
+            results["throughput"] = self.compare_throughput(
+                baseline_df["throughput_rps"].values,
+                capa_df["throughput_rps"].values
             )
-        
-        # CPU Utilization (weighted)
-        if 'cpu_util' in baseline_df.columns and 'duration_sec' in baseline_df.columns:
-            results['cpu_utilization'] = self.compare_cpu_utilization(
-                baseline_df['cpu_util'].values,
-                baseline_df['duration_sec'].values,
-                capa_df['cpu_util'].values,
-                capa_df['duration_sec'].values
+
+        if all(col in baseline_df.columns for col in ["cpu_util", "duration_sec"]) and \
+           all(col in capa_df.columns for col in ["cpu_util", "duration_sec"]):
+            results["cpu_utilization"] = self.compare_cpu_utilization(
+                baseline_df["cpu_util"].values,
+                baseline_df["duration_sec"].values,
+                capa_df["cpu_util"].values,
+                capa_df["duration_sec"].values
             )
-        
+
         return results
 
 
@@ -523,683 +821,476 @@ class SystemComparator:
 # =============================================================================
 
 class OverfittingDetector:
-    """
-    Detect overfitting by comparing train vs test performance
-    
-    From Jain Ch. 16: Proper experimental design requires validation
-    """
-    
     def __init__(self, threshold_mild: float = 1.2, threshold_severe: float = 1.5):
         self.threshold_mild = threshold_mild
         self.threshold_severe = threshold_severe
-    
-    def analyze(
-        self,
-        train_results: List[Dict],
-        test_results: List[Dict]
-    ) -> OverfittingAnalysis:
-        """
-        Analyze for overfitting
-        
-        Key metric: test_performance / train_performance
-        - < 1.2: Good generalization
-        - 1.2-1.5: Mild overfitting
-        - > 1.5: Severe overfitting
-        """
-        # Extract P95 latencies
-        train_p95 = np.mean([r.get('p95_latency_ms', 0) for r in train_results])
-        test_p95 = np.mean([r.get('p95_latency_ms', 0) for r in test_results])
-        
-        if train_p95 == 0:
-            ratio = 1.0
-        else:
-            ratio = test_p95 / train_p95
-        
-        # Determine severity
+
+    def analyze(self, train_results: List[Dict], test_results: List[Dict]) -> OverfittingAnalysis:
+        train_p95 = float(np.mean([r.get("p95_latency_ms", 0.0) for r in train_results])) if train_results else 0.0
+        test_p95 = float(np.mean([r.get("p95_latency_ms", 0.0) for r in test_results])) if test_results else 0.0
+        ratio = (test_p95 / train_p95) if train_p95 > 0 else 1.0
+
         if ratio >= self.threshold_severe:
-            severity = 'severe'
-            is_overfitting = True
-            recommendations = [
-                "Reduce state space further (fewer buckets)",
-                "Increase exploration (higher epsilon_min)",
-                "Add more training patterns",
-                "Increase reward noise",
-                "Use more aggressive Q-value regularization",
-                "Consider function approximation instead of tabular Q-learning"
-            ]
-        elif ratio >= self.threshold_mild:
-            severity = 'mild'
-            is_overfitting = True
-            recommendations = [
-                "Slightly reduce state space",
-                "Increase epsilon_min to 0.15",
-                "Add one more diverse training pattern",
-                "Increase replay buffer size"
-            ]
-        else:
-            severity = 'none'
-            is_overfitting = False
-            recommendations = [
-                "Model generalizes well",
-                "Consider deploying to production"
-            ]
-        
+            return OverfittingAnalysis(
+                train_p95=train_p95,
+                test_p95=test_p95,
+                generalization_ratio=ratio,
+                is_overfitting=True,
+                severity="severe",
+                recommendations=[
+                    "Reduce state space further (fewer buckets)",
+                    "Increase exploration (higher epsilon_min)",
+                    "Add more training patterns",
+                    "Consider stronger regularization / smoothing of Q-updates",
+                    "Consider function approximation instead of pure tabular Q-learning",
+                ],
+            )
+        if ratio >= self.threshold_mild:
+            return OverfittingAnalysis(
+                train_p95=train_p95,
+                test_p95=test_p95,
+                generalization_ratio=ratio,
+                is_overfitting=True,
+                severity="mild",
+                recommendations=[
+                    "Slightly reduce state space",
+                    "Increase epsilon_min moderately",
+                    "Add more diverse training patterns",
+                    "Increase replay buffer size (if used)",
+                ],
+            )
         return OverfittingAnalysis(
             train_p95=train_p95,
             test_p95=test_p95,
             generalization_ratio=ratio,
-            is_overfitting=is_overfitting,
-            severity=severity,
-            recommendations=recommendations
+            is_overfitting=False,
+            severity="none",
+            recommendations=["Model generalizes well; proceed with broader validation or shadow rollout."],
         )
 
 
 # =============================================================================
-# SHADOW MODE ANALYZER
+# SHADOW MODE ANALYZER (kept simple & correct)
 # =============================================================================
 
 class ShadowModeAnalyzer:
     """
-    Analyze Shadow Mode performance
+    decisions items: {"rl_action": int, "baseline_action": int, ...}
+    Expect action coding consistent with your system (e.g., 2=scale_up).
     """
-    
-    def analyze(self, decisions: List[Dict]) -> Dict:
-        """
-        Analyze shadow mode decisions
-        """
+    def analyze(self, decisions: List[Dict]) -> Dict[str, Any]:
         if not decisions:
             return {
-                'total_decisions': 0,
-                'agreement_rate': 0.0,
-                'rl_scale_up_rate': 0.0,
-                'baseline_scale_up_rate': 0.0,
-                'disagreements': []
+                "total_decisions": 0,
+                "agreement_rate": 0.0,
+                "rl_scale_up_rate": 0.0,
+                "baseline_scale_up_rate": 0.0,
+                "disagreements": [],
             }
-        
+
         total = len(decisions)
-        agreed = sum(1 for d in decisions if d.get('rl_action') == d.get('baseline_action'))
-        
-        rl_scale_up = sum(1 for d in decisions if d.get('rl_action') == 2)
-        baseline_scale_up = sum(1 for d in decisions if d.get('baseline_action') == 2)
-        
-        disagreements = [
-            d for d in decisions 
-            if d.get('rl_action') != d.get('baseline_action')
-        ]
-        
+        agreed = sum(1 for d in decisions if d.get("rl_action") == d.get("baseline_action"))
+
+        rl_scale_up = sum(1 for d in decisions if d.get("rl_action") == 2)
+        bl_scale_up = sum(1 for d in decisions if d.get("baseline_action") == 2)
+
+        disagreements = [d for d in decisions if d.get("rl_action") != d.get("baseline_action")]
+
         return {
-            'total_decisions': total,
-            'agreement_rate': agreed / total if total > 0 else 0,
-            'rl_scale_up_rate': rl_scale_up / total if total > 0 else 0,
-            'baseline_scale_up_rate': baseline_scale_up / total if total > 0 else 0,
-            'disagreements': disagreements[:10]  # First 10
+            "total_decisions": total,
+            "agreement_rate": agreed / total,
+            "rl_scale_up_rate": rl_scale_up / total,
+            "baseline_scale_up_rate": bl_scale_up / total,
+            "disagreements": disagreements[:10],
         }
 
 
 # =============================================================================
-# VISUALIZATION
+# VISUALIZATION (matplotlib only)
 # =============================================================================
 
 class Visualizer:
-    """
-    Create academic-quality visualizations
-    """
-    
-    def __init__(self, output_dir: str = './figures'):
+    def __init__(self, output_dir: str):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
-    
-    def plot_latency_comparison(
-        self,
-        baseline_latencies: np.ndarray,
-        capa_latencies: np.ndarray,
-        title: str = "Response Time Comparison"
-    ) -> str:
-        """
-        Box plot comparison of latencies
-        """
+
+    def plot_latency_comparison(self, baseline: np.ndarray, capa: np.ndarray) -> str:
+        b = np.asarray(baseline, dtype=float)
+        c = np.asarray(capa, dtype=float)
+        n = min(len(b), len(c))
+        b, c = b[:n], c[:n]
+
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # Box plot
-        ax1 = axes[0]
-        data = [baseline_latencies, capa_latencies]
-        bp = ax1.boxplot(data, labels=['Baseline HPA', 'CAPA+'], patch_artist=True)
-        bp['boxes'][0].set_facecolor(COLORS['baseline'])
-        bp['boxes'][1].set_facecolor(COLORS['capa'])
-        ax1.set_ylabel('P95 Latency (ms)')
-        ax1.set_title('Distribution Comparison')
-        ax1.grid(True, alpha=0.3)
-        
-        # Time series (if same length)
-        ax2 = axes[1]
-        if len(baseline_latencies) == len(capa_latencies):
-            x = np.arange(len(baseline_latencies))
-            ax2.plot(x, baseline_latencies, label='Baseline HPA', 
-                    color=COLORS['baseline'], alpha=0.7)
-            ax2.plot(x, capa_latencies, label='CAPA+',
-                    color=COLORS['capa'], alpha=0.7)
-            ax2.set_xlabel('Time (samples)')
-            ax2.set_ylabel('P95 Latency (ms)')
-            ax2.set_title('Time Series Comparison')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-        else:
-            # Histogram comparison
-            ax2.hist(baseline_latencies, bins=30, alpha=0.5, 
-                    label='Baseline HPA', color=COLORS['baseline'])
-            ax2.hist(capa_latencies, bins=30, alpha=0.5,
-                    label='CAPA+', color=COLORS['capa'])
-            ax2.set_xlabel('P95 Latency (ms)')
-            ax2.set_ylabel('Frequency')
-            ax2.set_title('Distribution Histogram')
-            ax2.legend()
-        
-        plt.suptitle(title, fontsize=14, fontweight='bold')
+
+        # Boxplot
+        ax = axes[0]
+        bp = ax.boxplot([b, c], labels=["Baseline HPA", "CAPA+"], patch_artist=True)
+        bp["boxes"][0].set_facecolor(COLORS["baseline"])
+        bp["boxes"][1].set_facecolor(COLORS["capa"])
+        ax.set_ylabel("P95 Latency (ms)")
+        ax.set_title("Distribution (samples)")
+        ax.grid(True, alpha=0.3)
+
+        # Time series
+        ax = axes[1]
+        ax.plot(np.arange(n), b, label="Baseline HPA", color=COLORS["baseline"], alpha=0.7)
+        ax.plot(np.arange(n), c, label="CAPA+", color=COLORS["capa"], alpha=0.7)
+        ax.set_xlabel("Sample index")
+        ax.set_ylabel("P95 Latency (ms)")
+        ax.set_title("Time Series (aligned)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
         plt.tight_layout()
-        
-        filepath = os.path.join(self.output_dir, 'latency_comparison.png')
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        out = os.path.join(self.output_dir, "latency_comparison.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close()
-        
-        return filepath
-    
-    def plot_overfitting_analysis(
-        self,
-        analysis: OverfittingAnalysis
-    ) -> str:
-        """
-        Visualize overfitting analysis
-        """
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # Bar chart: Train vs Test
-        ax1 = axes[0]
-        x = ['Training\n(seen patterns)', 'Testing\n(unseen patterns)']
-        heights = [analysis.train_p95, analysis.test_p95]
-        colors = ['#2ecc71', '#e74c3c' if analysis.is_overfitting else '#2ecc71']
-        
-        bars = ax1.bar(x, heights, color=colors, edgecolor='black', linewidth=1.5)
-        ax1.set_ylabel('P95 Latency (ms)')
-        ax1.set_title('Train vs Test Performance')
-        
-        # Add ratio annotation
-        ax1.annotate(
-            f'Ratio: {analysis.generalization_ratio:.2f}x',
-            xy=(1, analysis.test_p95),
-            xytext=(1.2, analysis.test_p95 * 1.1),
-            fontsize=12,
-            fontweight='bold',
-            color='red' if analysis.is_overfitting else 'green'
-        )
-        
-        # Severity gauge
-        ax2 = axes[1]
-        
-        # Create gauge-like visualization
-        categories = ['Good', 'Mild\nOverfit', 'Severe\nOverfit']
-        thresholds = [1.0, 1.2, 1.5, 2.0]
-        colors_gauge = ['#2ecc71', '#f39c12', '#e74c3c']
-        
-        # Background bars
-        for i, (cat, col) in enumerate(zip(categories, colors_gauge)):
-            ax2.barh(0, 1, left=i, color=col, alpha=0.3, height=0.5)
-            ax2.text(i + 0.5, 0, cat, ha='center', va='center', fontsize=10)
-        
-        # Marker for current ratio
-        marker_pos = min(2.9, max(0.1, (analysis.generalization_ratio - 1.0) / 0.5))
-        ax2.plot(marker_pos, 0, 'ko', markersize=20)
-        ax2.plot(marker_pos, 0, 'w|', markersize=15, mew=3)
-        
-        ax2.set_xlim(0, 3)
-        ax2.set_ylim(-0.5, 0.5)
-        ax2.set_title(f'Overfitting Severity: {analysis.severity.upper()}')
-        ax2.axis('off')
-        
-        plt.suptitle('Overfitting Analysis', fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        
-        filepath = os.path.join(self.output_dir, 'overfitting_analysis.png')
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        return filepath
-    
-    def plot_statistical_summary(
-        self,
-        comparisons: Dict[str, ComparisonResult]
-    ) -> str:
-        """
-        Create statistical summary visualization
-        """
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        
-        # 1. Improvement percentages
-        ax1 = axes[0, 0]
+        return out
+
+    def plot_statistical_summary(self, comparisons: Dict[str, ComparisonResult]) -> str:
         metrics = list(comparisons.keys())
-        improvements = [comparisons[m].improvement_pct for m in metrics]
-        colors = ['#2ecc71' if imp > 0 else '#e74c3c' for imp in improvements]
-        
-        bars = ax1.barh(metrics, improvements, color=colors, edgecolor='black')
-        ax1.axvline(x=0, color='black', linestyle='-', linewidth=1)
-        ax1.set_xlabel('Improvement (%)')
-        ax1.set_title('Performance Improvements')
-        
-        # Add value labels
-        for bar, imp in zip(bars, improvements):
-            width = bar.get_width()
-            ax1.text(width + 1, bar.get_y() + bar.get_height()/2,
-                    f'{imp:.1f}%', va='center', fontsize=10)
-        
-        # 2. Statistical significance
-        ax2 = axes[0, 1]
-        significant = [comparisons[m].significant for m in metrics]
-        p_values = [comparisons[m].p_value or 1.0 for m in metrics]
-        
-        colors_sig = ['#2ecc71' if sig else '#e74c3c' for sig in significant]
-        bars = ax2.barh(metrics, [-np.log10(p) if p > 0 else 0 for p in p_values], 
-                       color=colors_sig, edgecolor='black')
-        ax2.axvline(x=-np.log10(0.05), color='red', linestyle='--', 
-                   label='p=0.05 threshold')
-        ax2.set_xlabel('-log10(p-value)')
-        ax2.set_title('Statistical Significance')
-        ax2.legend()
-        
-        # 3. Effect sizes
-        ax3 = axes[1, 0]
-        effect_sizes = [abs(comparisons[m].effect_size or 0) for m in metrics]
-        
-        # Color by effect size magnitude
-        colors_effect = []
-        for es in effect_sizes:
-            if es < 0.2:
-                colors_effect.append('#95a5a6')  # Negligible
-            elif es < 0.5:
-                colors_effect.append('#f39c12')  # Small
-            elif es < 0.8:
-                colors_effect.append('#3498db')  # Medium
-            else:
-                colors_effect.append('#2ecc71')  # Large
-        
-        bars = ax3.barh(metrics, effect_sizes, color=colors_effect, edgecolor='black')
-        
-        # Add threshold lines
-        ax3.axvline(x=0.2, color='gray', linestyle=':', alpha=0.7, label='Small (0.2)')
-        ax3.axvline(x=0.5, color='gray', linestyle='--', alpha=0.7, label='Medium (0.5)')
-        ax3.axvline(x=0.8, color='gray', linestyle='-', alpha=0.7, label='Large (0.8)')
-        ax3.set_xlabel("Cohen's d (Effect Size)")
-        ax3.set_title('Effect Sizes')
-        ax3.legend(loc='lower right')
-        
-        # 4. Mean type summary
-        ax4 = axes[1, 1]
-        mean_types = [comparisons[m].mean_type for m in metrics]
-        
-        # Create table
-        table_data = []
+        imps = [comparisons[m].improvement_pct for m in metrics]
+        pvals = [comparisons[m].p_value if comparisons[m].p_value is not None else 1.0 for m in metrics]
+        sigs = [comparisons[m].significant for m in metrics]
+        effs = [abs(comparisons[m].effect_size) if comparisons[m].effect_size is not None else 0.0 for m in metrics]
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Improvements
+        ax = axes[0, 0]
+        colors = [COLORS["baseline"] if v >= 0 else COLORS["warning"] for v in imps]
+        ax.barh(metrics, imps, color=colors, edgecolor="black")
+        ax.axvline(0, color="black", linewidth=1)
+        ax.set_xlabel("Improvement (%)")
+        ax.set_title("Performance Improvements")
+
+        # Significance: -log10(p)
+        ax = axes[0, 1]
+        scores = [-math.log10(max(p, 1e-300)) for p in pvals]
+        colors = [COLORS["baseline"] if s else COLORS["warning"] for s in sigs]
+        ax.barh(metrics, scores, color=colors, edgecolor="black")
+        ax.axvline(-math.log10(0.05), color=COLORS["warning"], linestyle="--", label="p=0.05")
+        ax.set_xlabel("-log10(p-value)")
+        ax.set_title("Statistical Significance")
+        ax.legend()
+
+        # Effect sizes
+        ax = axes[1, 0]
+        ax.barh(metrics, effs, color=COLORS["neutral"], edgecolor="black")
+        ax.axvline(0.2, color="gray", linestyle=":", alpha=0.7)
+        ax.axvline(0.5, color="gray", linestyle="--", alpha=0.7)
+        ax.axvline(0.8, color="gray", linestyle="-", alpha=0.7)
+        ax.set_xlabel("Cohen's d (absolute)")
+        ax.set_title("Effect Sizes")
+
+        # Table summary
+        ax = axes[1, 1]
+        ax.axis("off")
+        rows = []
         for m in metrics:
-            c = comparisons[m]
-            table_data.append([
-                m,
-                c.mean_type,
-                f'{c.baseline_value:.2f}',
-                f'{c.capa_value:.2f}',
-                '✓' if c.significant else '✗'
+            r = comparisons[m]
+            rows.append([
+                r.metric_name,
+                r.mean_type,
+                f"{r.baseline_value:.3f}",
+                f"{r.capa_value:.3f}",
+                "Yes" if r.significant else "No",
             ])
-        
-        ax4.axis('off')
-        table = ax4.table(
-            cellText=table_data,
-            colLabels=['Metric', 'Mean Type', 'Baseline', 'CAPA+', 'Sig?'],
-            loc='center',
-            cellLoc='center'
+        table = ax.table(
+            cellText=rows,
+            colLabels=["Metric", "Mean Type", "Baseline", "CAPA+", "Sig?"],
+            loc="center",
+            cellLoc="center"
         )
         table.auto_set_font_size(False)
         table.set_fontsize(10)
         table.scale(1.2, 1.5)
-        ax4.set_title('Summary Table (Jain Ch. 12 Mean Selection)')
-        
-        plt.suptitle('Statistical Analysis Summary', fontsize=14, fontweight='bold')
+        ax.set_title("Summary Table (Jain Ch. 12)")
+
         plt.tight_layout()
-        
-        filepath = os.path.join(self.output_dir, 'statistical_summary.png')
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        out = os.path.join(self.output_dir, "statistical_summary.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close()
-        
-        return filepath
-    
-    def plot_shadow_mode_analysis(
-        self,
-        shadow_analysis: Dict
-    ) -> str:
-        """
-        Visualize shadow mode analysis
-        """
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # 1. Agreement rate pie chart
-        ax1 = axes[0]
-        agreement = shadow_analysis['agreement_rate']
-        sizes = [agreement, 1 - agreement]
-        labels = ['Agree', 'Disagree']
-        colors = ['#2ecc71', '#e74c3c']
-        explode = (0.05, 0)
-        
-        ax1.pie(sizes, explode=explode, labels=labels, colors=colors,
-               autopct='%1.1f%%', startangle=90)
-        ax1.set_title(f'RL-Baseline Agreement\n({shadow_analysis["total_decisions"]} decisions)')
-        
-        # 2. Action distribution
-        ax2 = axes[1]
-        x = ['Scale Up', 'Scale Down']
-        rl_rates = [shadow_analysis['rl_scale_up_rate'], 
-                   1 - shadow_analysis['rl_scale_up_rate'] - 0.5]  # Approximate
-        baseline_rates = [shadow_analysis['baseline_scale_up_rate'],
-                         1 - shadow_analysis['baseline_scale_up_rate'] - 0.5]
-        
-        x_pos = np.arange(len(x))
-        width = 0.35
-        
-        ax2.bar(x_pos - width/2, [shadow_analysis['rl_scale_up_rate'], 0.1], 
-               width, label='RL', color=COLORS['capa'])
-        ax2.bar(x_pos + width/2, [shadow_analysis['baseline_scale_up_rate'], 0.1],
-               width, label='Baseline', color=COLORS['baseline'])
-        ax2.set_xticks(x_pos)
-        ax2.set_xticklabels(x)
-        ax2.set_ylabel('Rate')
-        ax2.set_title('Scale-Up Action Rates')
-        ax2.legend()
-        
-        # 3. Readiness checklist
-        ax3 = axes[2]
-        ax3.axis('off')
-        
-        checklist = [
-            ('Sufficient observations (≥500)', shadow_analysis['total_decisions'] >= 500),
-            ('Reasonable agreement (≥60%)', agreement >= 0.6),
-            ('Learning stability', True),  # Simplified
-        ]
-        
-        y_pos = 0.8
-        for item, passed in checklist:
-            symbol = '✓' if passed else '✗'
-            color = '#2ecc71' if passed else '#e74c3c'
-            ax3.text(0.1, y_pos, f'{symbol} {item}', fontsize=12, color=color,
-                    transform=ax3.transAxes)
-            y_pos -= 0.15
-        
-        ready = all(passed for _, passed in checklist)
-        ax3.text(0.1, 0.2, f'\nReady for Active Mode: {"YES ✓" if ready else "NO ✗"}',
-                fontsize=14, fontweight='bold',
-                color='#2ecc71' if ready else '#e74c3c',
-                transform=ax3.transAxes)
-        
-        ax3.set_title('Transition Readiness')
-        
-        plt.suptitle('Shadow Mode Analysis', fontsize=14, fontweight='bold')
+        return out
+
+    def plot_overfitting(self, analysis: OverfittingAnalysis) -> str:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        xs = ["Train", "Test"]
+        ys = [analysis.train_p95, analysis.test_p95]
+        colors = [COLORS["baseline"], COLORS["warning"] if analysis.is_overfitting else COLORS["baseline"]]
+        ax.bar(xs, ys, color=colors, edgecolor="black")
+        ax.set_ylabel("P95 Latency (ms)")
+        ax.set_title(f"Overfitting Check (ratio={analysis.generalization_ratio:.2f}x, {analysis.severity})")
+        out = os.path.join(self.output_dir, "overfitting.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close()
+        return out
+
+    def plot_shadow(self, shadow: Dict[str, Any]) -> str:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        # Agreement pie
+        ax = axes[0]
+        agree = shadow["agreement_rate"]
+        ax.pie([agree, 1 - agree], labels=["Agree", "Disagree"], autopct="%1.1f%%",
+               colors=[COLORS["baseline"], COLORS["warning"]], startangle=90)
+        ax.set_title(f"Agreement (N={shadow['total_decisions']})")
+
+        # Scale-up rate bars
+        ax = axes[1]
+        ax.bar(["RL scale-up", "Baseline scale-up"],
+               [shadow["rl_scale_up_rate"], shadow["baseline_scale_up_rate"]],
+               color=[COLORS["capa"], COLORS["baseline"]],
+               edgecolor="black")
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Rate")
+        ax.set_title("Scale-up Rates")
+
+        out = os.path.join(self.output_dir, "shadow_mode.png")
         plt.tight_layout()
-        
-        filepath = os.path.join(self.output_dir, 'shadow_mode_analysis.png')
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close()
-        
-        return filepath
+        return out
 
 
 # =============================================================================
-# REPORT GENERATOR
+# REPORT GENERATOR (unified)
 # =============================================================================
 
 class ReportGenerator:
-    """
-    Generate academic-quality analysis report
-    """
-    
-    def __init__(self, output_dir: str = './report'):
+    def __init__(self, output_dir: str, confidence: float = 0.95):
         self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        self.visualizer = Visualizer(os.path.join(output_dir, 'figures'))
-    
-    def generate_report(
+        self.fig_dir = os.path.join(output_dir, "figures")
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.fig_dir, exist_ok=True)
+        self.viz = Visualizer(self.fig_dir)
+        self.confidence = confidence
+
+    def generate(
         self,
         baseline_df: pd.DataFrame,
         capa_df: pd.DataFrame,
         train_results: Optional[List[Dict]] = None,
         test_results: Optional[List[Dict]] = None,
-        shadow_decisions: Optional[List[Dict]] = None
+        shadow_decisions: Optional[List[Dict]] = None,
+        remove_transient_enabled: bool = False,
+        transient_method: str = "batch_variance"
     ) -> str:
-        """
-        Generate comprehensive analysis report
-        """
-        report_lines = []
-        report_lines.append("=" * 80)
-        report_lines.append("CAPA+ AUTOSCALER ACADEMIC ANALYSIS REPORT")
-        report_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report_lines.append("=" * 80)
-        report_lines.append("")
-        
-        # 1. System Comparison
-        report_lines.append("## 1. SYSTEM COMPARISON (Jain Ch. 12)")
-        report_lines.append("-" * 40)
-        
-        comparator = SystemComparator()
-        comparisons = comparator.full_comparison(baseline_df, capa_df)
-        
-        for name, result in comparisons.items():
-            report_lines.append(f"\n### {result.metric_name}")
-            report_lines.append(f"  Mean Type: {result.mean_type} (Jain Ch. 12)")
-            report_lines.append(f"  Baseline: {result.baseline_value:.2f}")
-            report_lines.append(f"  CAPA+: {result.capa_value:.2f}")
-            report_lines.append(f"  Improvement: {result.improvement_pct:+.1f}%")
-            
-            if result.p_value is not None:
-                report_lines.append(f"  p-value: {result.p_value:.4f}")
-                report_lines.append(f"  Significant (α=0.05): {'Yes' if result.significant else 'No'}")
-            
-            if result.effect_size is not None:
-                effect_interp = self._interpret_effect_size(result.effect_size)
-                report_lines.append(f"  Effect Size (Cohen's d): {result.effect_size:.3f} ({effect_interp})")
-            
-            if result.confidence_interval:
-                report_lines.append(f"  95% CI: [{result.confidence_interval[0]:.2f}, {result.confidence_interval[1]:.2f}]")
-        
-        # Generate comparison visualization
-        if 'p95_latency_ms' in baseline_df.columns:
-            fig_path = self.visualizer.plot_latency_comparison(
-                baseline_df['p95_latency_ms'].values,
-                capa_df['p95_latency_ms'].values
+        lines: List[str] = []
+        lines.append("=" * 88)
+        lines.append("CAPA+ UNIFIED COMPARISON REPORT (Jain 1991 compliant)")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 88)
+        lines.append("")
+
+        # Optional transient removal on latency series
+        baseline_used = baseline_df.copy()
+        capa_used = capa_df.copy()
+
+        transient_removed = 0
+        if remove_transient_enabled and "p95_latency_ms" in baseline_df.columns and len(baseline_df) > 20:
+            steady_b, tlen = remove_transient(list(baseline_df["p95_latency_ms"].values), method=transient_method)
+            transient_removed = tlen
+            # align lengths after removal
+            baseline_used = baseline_used.iloc[tlen:].reset_index(drop=True)
+            capa_used = capa_used.iloc[tlen:].reset_index(drop=True)
+
+        lines.append("## 1. DATA SUMMARY")
+        lines.append("-" * 40)
+        lines.append(f"Baseline samples: {len(baseline_used)}")
+        lines.append(f"CAPA+ samples: {len(capa_used)}")
+        lines.append(f"Transient removed: {transient_removed} (enabled={remove_transient_enabled}, method={transient_method})")
+        lines.append("")
+
+        # System comparison
+        lines.append("## 2. SYSTEM COMPARISON (Jain Ch. 12 + Ch. 13 + Ch. 25)")
+        lines.append("-" * 40)
+
+        comparator = SystemComparator(confidence=self.confidence)
+        comparisons = comparator.full_comparison(baseline_used, capa_used)
+
+        for key, r in comparisons.items():
+            lines.append(f"\n### {r.metric_name}")
+            lines.append(f"Mean Type: {r.mean_type}")
+            lines.append(f"Baseline: {r.baseline_value:.4f}")
+            lines.append(f"CAPA+: {r.capa_value:.4f}")
+            lines.append(f"Improvement: {r.improvement_pct:+.2f}%")
+
+            if r.p_value is not None:
+                lines.append(f"p-value: {r.p_value:.6f}")
+                lines.append(f"Significant (α=0.05): {'Yes' if r.significant else 'No'}")
+
+            if r.effect_size is not None:
+                lines.append(f"Effect size (Cohen's d): {r.effect_size:.4f} ({self._interpret_effect_size(r.effect_size)})")
+
+            if r.confidence_interval is not None:
+                lines.append(f"{int(self.confidence*100)}% CI: [{r.confidence_interval[0]:.4f}, {r.confidence_interval[1]:.4f}]")
+
+            if r.metadata:
+                lines.append("Metadata:")
+                for mk, mv in r.metadata.items():
+                    lines.append(f"  - {mk}: {mv}")
+
+        # Precision check (naive; caller should use batch means CI if highly autocorrelated)
+        if "p95_latency_ms" in baseline_used.columns and len(baseline_used) >= 10:
+            ok, prec, add = check_precision(
+                baseline_used["p95_latency_ms"].values,
+                desired_precision=0.10,
+                confidence=self.confidence
             )
-            report_lines.append(f"\n  [Figure: {fig_path}]")
-        
-        # Statistical summary figure
-        fig_path = self.visualizer.plot_statistical_summary(comparisons)
-        report_lines.append(f"\n  [Figure: {fig_path}]")
-        
-        # 2. Overfitting Analysis
-        if train_results and test_results:
-            report_lines.append("\n\n## 2. OVERFITTING ANALYSIS (Jain Ch. 16)")
-            report_lines.append("-" * 40)
-            
-            detector = OverfittingDetector()
-            overfit_analysis = detector.analyze(train_results, test_results)
-            
-            report_lines.append(f"\n  Training P95 (seen patterns): {overfit_analysis.train_p95:.1f} ms")
-            report_lines.append(f"  Testing P95 (unseen patterns): {overfit_analysis.test_p95:.1f} ms")
-            report_lines.append(f"  Generalization Ratio: {overfit_analysis.generalization_ratio:.2f}x")
-            report_lines.append(f"\n  Overfitting Detected: {'YES' if overfit_analysis.is_overfitting else 'NO'}")
-            report_lines.append(f"  Severity: {overfit_analysis.severity.upper()}")
-            
-            report_lines.append("\n  Recommendations:")
-            for rec in overfit_analysis.recommendations:
-                report_lines.append(f"    - {rec}")
-            
-            # Generate overfitting visualization
-            fig_path = self.visualizer.plot_overfitting_analysis(overfit_analysis)
-            report_lines.append(f"\n  [Figure: {fig_path}]")
-        
-        # 3. Shadow Mode Analysis
-        if shadow_decisions:
-            report_lines.append("\n\n## 3. SHADOW MODE ANALYSIS (INTROD_1 Ch. 2)")
-            report_lines.append("-" * 40)
-            
-            analyzer = ShadowModeAnalyzer()
-            shadow_analysis = analyzer.analyze(shadow_decisions)
-            
-            report_lines.append(f"\n  Total Decisions: {shadow_analysis['total_decisions']}")
-            report_lines.append(f"  RL-Baseline Agreement: {shadow_analysis['agreement_rate']:.1%}")
-            report_lines.append(f"  RL Scale-Up Rate: {shadow_analysis['rl_scale_up_rate']:.1%}")
-            report_lines.append(f"  Baseline Scale-Up Rate: {shadow_analysis['baseline_scale_up_rate']:.1%}")
-            
-            # Generate shadow mode visualization
-            fig_path = self.visualizer.plot_shadow_mode_analysis(shadow_analysis)
-            report_lines.append(f"\n  [Figure: {fig_path}]")
-        
-        # 4. Methodology Notes
-        report_lines.append("\n\n## 4. METHODOLOGY NOTES")
-        report_lines.append("-" * 40)
-        report_lines.append("""
-  This analysis follows academic best practices from:
-  
-  - Jain (1991): "The Art of Computer Systems Performance Analysis"
-    - Chapter 11: Avoiding ratio games through geometric mean
-    - Chapter 12: Correct mean selection (arithmetic/geometric/harmonic)
-    - Example 12.3: Weighted CPU utilization
-    
-  - Harchol-Balter (2013): "Performance Modeling and Design of Computer Systems"
-    - Chapter 5: Sample paths and convergence
-    - Chapter 14: Variance reduction techniques
-    
-  - INTROD_1: "Introduction to Computer System Performance Evaluation"
-    - Chapter 2: Measurement techniques (Shadow Mode)
-    - Chapter 3: Statistical data analysis
-""")
-        
-        # 5. Summary
-        report_lines.append("\n\n## 5. EXECUTIVE SUMMARY")
-        report_lines.append("-" * 40)
-        
-        # Generate summary based on results
-        if comparisons.get('response_time'):
-            rt = comparisons['response_time']
-            if rt.improvement_pct > 0 and rt.significant:
-                verdict = "CAPA+ shows statistically significant improvement"
-            elif rt.improvement_pct > 0:
-                verdict = "CAPA+ shows improvement but not statistically significant"
-            elif rt.improvement_pct < 0 and rt.significant:
-                verdict = "CAPA+ shows statistically significant degradation"
+            lines.append("\n### Sample Size Adequacy (Jain 13.9)")
+            lines.append(f"Current precision: ±{prec*100:.2f}% of mean (naive CI)")
+            lines.append("Target precision: ±10% of mean")
+            lines.append("Adequate: " + ("Yes" if ok else f"No (need ~{add} more samples)"))
+
+        # Figures
+        if "p95_latency_ms" in baseline_used.columns and "p95_latency_ms" in capa_used.columns:
+            fig1 = self.viz.plot_latency_comparison(
+                baseline_used["p95_latency_ms"].values,
+                capa_used["p95_latency_ms"].values
+            )
+            lines.append(f"\n[Figure] Latency comparison: {fig1}")
+
+        fig2 = self.viz.plot_statistical_summary(comparisons)
+        lines.append(f"[Figure] Statistical summary: {fig2}")
+
+        # Overfitting
+        if train_results is not None and test_results is not None and len(train_results) > 0 and len(test_results) > 0:
+            lines.append("\n\n## 3. OVERFITTING ANALYSIS")
+            lines.append("-" * 40)
+            over = OverfittingDetector().analyze(train_results, test_results)
+            lines.append(f"Train P95: {over.train_p95:.2f} ms")
+            lines.append(f"Test P95: {over.test_p95:.2f} ms")
+            lines.append(f"Generalization ratio: {over.generalization_ratio:.2f}x")
+            lines.append(f"Overfitting: {'YES' if over.is_overfitting else 'NO'} (severity={over.severity})")
+            lines.append("Recommendations:")
+            for rec in over.recommendations:
+                lines.append(f"  - {rec}")
+            fig3 = self.viz.plot_overfitting(over)
+            lines.append(f"[Figure] Overfitting: {fig3}")
+
+        # Shadow mode
+        if shadow_decisions is not None and len(shadow_decisions) > 0:
+            lines.append("\n\n## 4. SHADOW MODE ANALYSIS")
+            lines.append("-" * 40)
+            shadow = ShadowModeAnalyzer().analyze(shadow_decisions)
+            lines.append(f"Total decisions: {shadow['total_decisions']}")
+            lines.append(f"Agreement rate: {shadow['agreement_rate']:.2%}")
+            lines.append(f"RL scale-up rate: {shadow['rl_scale_up_rate']:.2%}")
+            lines.append(f"Baseline scale-up rate: {shadow['baseline_scale_up_rate']:.2%}")
+            fig4 = self.viz.plot_shadow(shadow)
+            lines.append(f"[Figure] Shadow mode: {fig4}")
+
+        # Methodology notes
+        lines.append("\n\n## 5. METHODOLOGY NOTES")
+        lines.append("-" * 40)
+        lines.append(
+            "This report follows Jain (1991) for mean selection (Ch. 12), paired comparisons (Ch. 13.4.1),\n"
+            "sample size adequacy (Ch. 13.9), transient removal (Ch. 25.3), and batch means for autocorrelation\n"
+            "(Ch. 25.5.2, with autocovariance per Ch. 27.3). Speedups use geometric mean (Ch. 12.5).\n"
+        )
+
+        # Executive summary
+        lines.append("\n\n## 6. EXECUTIVE SUMMARY")
+        lines.append("-" * 40)
+        if "response_time" in comparisons:
+            r = comparisons["response_time"]
+            if r.improvement_pct > 0 and r.significant:
+                verdict = "CAPA+ shows statistically significant improvement in response time."
+            elif r.improvement_pct > 0:
+                verdict = "CAPA+ shows improvement, but not statistically significant."
+            elif r.improvement_pct < 0 and r.significant:
+                verdict = "CAPA+ shows statistically significant degradation."
             else:
-                verdict = "No significant difference between systems"
-            
-            report_lines.append(f"\n  {verdict}")
-            report_lines.append(f"  Response time improvement: {rt.improvement_pct:+.1f}%")
-        
-        if train_results and test_results:
-            detector = OverfittingDetector()
-            overfit = detector.analyze(train_results, test_results)
-            if overfit.is_overfitting:
-                report_lines.append(f"\n  ⚠️ WARNING: {overfit.severity} overfitting detected")
-                report_lines.append(f"     Model may not generalize to new load patterns")
-            else:
-                report_lines.append(f"\n  ✓ Model generalizes well to unseen patterns")
-        
-        report_lines.append("\n" + "=" * 80)
-        report_lines.append("END OF REPORT")
-        report_lines.append("=" * 80)
-        
-        # Write report
-        report_text = "\n".join(report_lines)
-        report_path = os.path.join(self.output_dir, 'analysis_report.txt')
-        
-        with open(report_path, 'w') as f:
+                verdict = "No statistically significant difference detected."
+            lines.append(verdict)
+            lines.append(f"Response time improvement: {r.improvement_pct:+.2f}%")
+
+        lines.append("\n" + "=" * 88)
+        lines.append("END OF REPORT")
+        lines.append("=" * 88)
+
+        report_text = "\n".join(lines)
+        report_path = os.path.join(self.output_dir, "unified_comparison_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_text)
-        
+
         print(report_text)
-        
         return report_path
-    
-    def _interpret_effect_size(self, d: float) -> str:
-        """Interpret Cohen's d effect size"""
+
+    @staticmethod
+    def _interpret_effect_size(d: float) -> str:
         d = abs(d)
         if d < 0.2:
             return "negligible"
-        elif d < 0.5:
+        if d < 0.5:
             return "small"
-        elif d < 0.8:
+        if d < 0.8:
             return "medium"
-        else:
-            return "large"
+        return "large"
 
 
 # =============================================================================
-# DATA LOADING UTILITIES
+# DATA LOADING
 # =============================================================================
 
 def load_experiment_data(directory: str) -> Tuple[pd.DataFrame, pd.DataFrame, List, List, List]:
-    """
-    Load experiment data from directory
-    """
     baseline_df = None
     capa_df = None
-    train_results = []
-    test_results = []
-    shadow_decisions = []
-    
-    # Try to load baseline results
-    baseline_file = os.path.join(directory, 'baseline_results.csv')
+    train_results: List[Dict] = []
+    test_results: List[Dict] = []
+    shadow_decisions: List[Dict] = []
+
+    baseline_file = os.path.join(directory, "baseline_results.csv")
     if os.path.exists(baseline_file):
         baseline_df = pd.read_csv(baseline_file)
-    
-    # Try to load CAPA+ results
-    capa_file = os.path.join(directory, 'capa_results.csv')
+
+    capa_file = os.path.join(directory, "capa_results.csv")
     if os.path.exists(capa_file):
         capa_df = pd.read_csv(capa_file)
-    
-    # Try to load JSON results
-    train_file = os.path.join(directory, 'train_results.json')
+
+    train_file = os.path.join(directory, "train_results.json")
     if os.path.exists(train_file):
-        with open(train_file, 'r') as f:
+        with open(train_file, "r", encoding="utf-8") as f:
             train_results = json.load(f)
-    
-    test_file = os.path.join(directory, 'test_results.json')
+
+    test_file = os.path.join(directory, "test_results.json")
     if os.path.exists(test_file):
-        with open(test_file, 'r') as f:
+        with open(test_file, "r", encoding="utf-8") as f:
             test_results = json.load(f)
-    
-    decisions_file = os.path.join(directory, 'decisions_history.json')
+
+    decisions_file = os.path.join(directory, "decisions_history.json")
     if os.path.exists(decisions_file):
-        with open(decisions_file, 'r') as f:
+        with open(decisions_file, "r", encoding="utf-8") as f:
             shadow_decisions = json.load(f)
-    
+
     return baseline_df, capa_df, train_results, test_results, shadow_decisions
 
 
-def create_sample_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Create sample data for demonstration
-    """
+def create_sample_data() -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict], List[Dict], List[Dict]]:
     np.random.seed(42)
-    n_samples = 100
-    
-    # Baseline: Higher latency, more variance
+    n = 200
     baseline_df = pd.DataFrame({
-        'timestamp': np.arange(n_samples),
-        'p95_latency_ms': np.random.normal(300, 80, n_samples),
-        'throughput_rps': np.random.normal(500, 50, n_samples),
-        'cpu_util': np.random.uniform(0.3, 0.8, n_samples),
-        'duration_sec': np.ones(n_samples) * 10,
-        'pods_ready': np.random.randint(2, 6, n_samples)
+        "timestamp": np.arange(n),
+        "p95_latency_ms": np.random.normal(200, 35, n),
+        "throughput_rps": np.random.normal(500, 50, n),
+        "cpu_util": np.random.uniform(0.3, 0.8, n),
+        "duration_sec": np.ones(n) * 10,
     })
-    
-    # CAPA+: Lower latency but sometimes worse
     capa_df = pd.DataFrame({
-        'timestamp': np.arange(n_samples),
-        'p95_latency_ms': np.random.normal(250, 100, n_samples),  # Lower mean, higher variance
-        'throughput_rps': np.random.normal(520, 40, n_samples),
-        'cpu_util': np.random.uniform(0.4, 0.7, n_samples),
-        'duration_sec': np.ones(n_samples) * 10,
-        'pods_ready': np.random.randint(2, 7, n_samples)
+        "timestamp": np.arange(n),
+        "p95_latency_ms": np.random.normal(180, 30, n),
+        "throughput_rps": np.random.normal(520, 40, n),
+        "cpu_util": np.random.uniform(0.4, 0.7, n),
+        "duration_sec": np.ones(n) * 10,
     })
-    
-    return baseline_df, capa_df
+
+    train_results = [{"p95_latency_ms": 240}, {"p95_latency_ms": 260}]
+    test_results = [{"p95_latency_ms": 280}, {"p95_latency_ms": 300}]
+    shadow_decisions = [{"rl_action": 1, "baseline_action": 1} for _ in range(400)] + \
+                     [{"rl_action": 2, "baseline_action": 1} for _ in range(100)]
+
+    return baseline_df, capa_df, train_results, test_results, shadow_decisions
 
 
 # =============================================================================
@@ -1208,94 +1299,62 @@ def create_sample_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Academic Analysis for CAPA+ Autoscaler',
+        description="Unified comparison + academic statistical report for CAPA+",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze from data directory
-  python generate_academic_analysis.py --data-dir ./results
-
-  # Generate sample analysis
-  python generate_academic_analysis.py --sample
-
-  # Custom output directory
-  python generate_academic_analysis.py --data-dir ./results --output-dir ./report
-        """
+  python generate_unified_comparison.py --data-dir ./results --output-dir ./analysis_output
+  python generate_unified_comparison.py --baseline-csv baseline.csv --capa-csv capa.csv --output-dir ./out
+  python generate_unified_comparison.py --sample
+"""
     )
-    
-    parser.add_argument('--data-dir', type=str, default='./results',
-                       help='Directory containing experiment results')
-    parser.add_argument('--output-dir', type=str, default='./analysis_output',
-                       help='Output directory for report and figures')
-    parser.add_argument('--sample', action='store_true',
-                       help='Use sample data for demonstration')
-    parser.add_argument('--baseline-csv', type=str,
-                       help='Path to baseline results CSV')
-    parser.add_argument('--capa-csv', type=str,
-                       help='Path to CAPA+ results CSV')
-    
+    parser.add_argument("--data-dir", type=str, default="./results", help="Directory containing experiment results")
+    parser.add_argument("--output-dir", type=str, default="./analysis_output", help="Output directory")
+    parser.add_argument("--baseline-csv", type=str, default=None, help="Path to baseline CSV")
+    parser.add_argument("--capa-csv", type=str, default=None, help="Path to CAPA+ CSV")
+    parser.add_argument("--sample", action="store_true", help="Use generated sample data")
+    parser.add_argument("--confidence", type=float, default=0.95, help="Confidence level (default 0.95)")
+    parser.add_argument("--remove-transient", action="store_true", help="Enable transient removal (Jain 25.3)")
+    parser.add_argument("--transient-method", type=str, default="batch_variance",
+                        choices=["batch_variance", "moving_average", "rule_of_thumb"],
+                        help="Transient detection method")
+
     args = parser.parse_args()
-    
-    print("=" * 60)
-    print("CAPA+ Academic Analysis Tool")
-    print("Following Jain (1991), Harchol-Balter (2013), INTROD_1")
-    print("=" * 60)
-    print()
-    
-    # Load or create data
+
+    print("=" * 70)
+    print("CAPA+ Unified Comparison Tool (Jain 1991 compliant)")
+    print("=" * 70)
+
     if args.sample:
-        print("Using sample data for demonstration...")
-        baseline_df, capa_df = create_sample_data()
-        train_results = [{'p95_latency_ms': 240}, {'p95_latency_ms': 260}]
-        test_results = [{'p95_latency_ms': 280}, {'p95_latency_ms': 300}]
-        shadow_decisions = [
-            {'rl_action': 1, 'baseline_action': 1} for _ in range(400)
-        ] + [
-            {'rl_action': 2, 'baseline_action': 1} for _ in range(100)
-        ]
+        baseline_df, capa_df, train_results, test_results, shadow_decisions = create_sample_data()
     elif args.baseline_csv and args.capa_csv:
-        print(f"Loading baseline from: {args.baseline_csv}")
-        print(f"Loading CAPA+ from: {args.capa_csv}")
         baseline_df = pd.read_csv(args.baseline_csv)
         capa_df = pd.read_csv(args.capa_csv)
-        train_results = None
-        test_results = None
-        shadow_decisions = None
+        train_results, test_results, shadow_decisions = None, None, None
     else:
-        print(f"Loading data from: {args.data_dir}")
-        baseline_df, capa_df, train_results, test_results, shadow_decisions = \
-            load_experiment_data(args.data_dir)
-    
-    # Validate data
+        baseline_df, capa_df, train_results, test_results, shadow_decisions = load_experiment_data(args.data_dir)
+
     if baseline_df is None or capa_df is None:
         print("\nERROR: Could not load baseline or CAPA+ data.")
-        print("Please provide data using one of these methods:")
-        print("  1. --data-dir with baseline_results.csv and capa_results.csv")
-        print("  2. --baseline-csv and --capa-csv")
-        print("  3. --sample for demonstration")
         sys.exit(1)
-    
-    print(f"\nBaseline samples: {len(baseline_df)}")
-    print(f"CAPA+ samples: {len(capa_df)}")
-    
-    # Generate report
-    print(f"\nGenerating report in: {args.output_dir}")
-    print("-" * 40)
-    
-    generator = ReportGenerator(args.output_dir)
-    report_path = generator.generate_report(
+
+    gen = ReportGenerator(args.output_dir, confidence=args.confidence)
+    report_path = gen.generate(
         baseline_df=baseline_df,
         capa_df=capa_df,
         train_results=train_results,
         test_results=test_results,
-        shadow_decisions=shadow_decisions
+        shadow_decisions=shadow_decisions,
+        remove_transient_enabled=args.remove_transient,
+        transient_method=args.transient_method
     )
-    
-    print(f"\n{'=' * 60}")
-    print(f"Report saved to: {report_path}")
-    print(f"Figures saved to: {os.path.join(args.output_dir, 'figures')}")
-    print(f"{'=' * 60}")
+
+    print("\n" + "=" * 70)
+    print(f"Report saved: {report_path}")
+    print(f"Figures saved: {os.path.join(args.output_dir, 'figures')}")
+    print("=" * 70)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore")
     main()
