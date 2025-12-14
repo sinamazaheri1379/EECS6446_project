@@ -515,12 +515,12 @@ def main():
     b_p95 = global_metrics.get("baseline_latency_p95_ms", np.array([]))
     c_p95 = global_metrics.get("capa_latency_p95_ms", np.array([]))
     if len(b_p95) >= 2 and len(c_p95) >= 2:
-        # transient removal applied before speedup
-        b2, _ = remove_transient_fixed_fraction(b_p95, args.transient_frac)
-        c2, _ = remove_transient_fixed_fraction(c_p95, args.transient_frac)
+        # Transient removal: align first, then remove same absolute count (maintains pairing)
+        n_common = min(len(b_p95), len(c_p95))
+        k = int(args.transient_frac * n_common) if n_common >= 50 else 0
+        b2 = b_p95[k:n_common]
+        c2 = c_p95[k:n_common]
         gm, ci = geometric_mean_ci_speedup(b2, c2, confidence=args.confidence)
-        print("\n--- SPEEDUP (Geometric mean on latency_p95_ms; Jain 12.5) ---")
-        print(f"Speedup (Baseline/CAPA): {gm:.4f}x   CI[{ci.ci_lower:.4f}, {ci.ci_upper:.4f}]  (n={ci.n})")
 
     print("\n--- PER-SERVICE COMPARISON ---")
     svc_rows = []
@@ -546,9 +546,11 @@ def main():
         ])
 
         if args.plots:
-            # plot after transient
-            b2, _ = remove_transient_fixed_fraction(b, args.transient_frac)
-            c2, _ = remove_transient_fixed_fraction(c, args.transient_frac)
+            # Plot after transient: align first, then remove same absolute count
+            n_common = min(len(b), len(c))
+            k = int(args.transient_frac * n_common) if n_common >= 50 else 0
+            b2 = b[k:n_common]
+            c2 = c[k:n_common]
             plot_box(args.output_dir, svc, "latency_p95_ms", b2, c2)
 
     print_table(
