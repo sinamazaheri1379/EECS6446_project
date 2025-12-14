@@ -2,51 +2,41 @@
 """
 generate_unified_comparison_academic.py
 ========================================================
-Academic Statistical Analysis for CAPA+ v3 CLEAN Experiments
-(Follows Jain, 1991. Designed for publishable rigor.)
+Academic / Statistically rigorous comparison for CAPA+ experiments
+Following Jain (1991), Chapters 12, 13, 25.
 
-Implements (per Audit):
-1) Transient removal (default: first 10%, configurable)
-2) Batch means CI for autocorrelated observations (Jain 25.5.2)
-3) Paired comparison on differences (Jain 13.4.1) + paired t-test
-4) Mean selection:
-   - Latency: Arithmetic
-   - Throughput: Harmonic
-   - Speedup ratios: Geometric (in log-space CI)
-5) Sample size adequacy / precision check (Jain 13.9)
-6) Per-service strict comparison + system-level aggregation
-7) Saves summary CSV + plots
-
-Inputs:
-- baseline_raw_<runid>.csv
-- capa_raw_<runid>.csv
-Both are produced by unified_experiment_v3_clean.py
-
-Pairing strategy:
-- Observations are paired by keys: (pattern, step_idx, tick, service)
-- This ensures same workload schedule point is compared across runs.
+Key features:
+- Loads paired baseline_run_*.csv and capa_run_*.csv from results/<exp_name>/
+- Aligns paired observations using tick + service (+ pattern/step_idx/users)
+- Transient removal (default: first 10%)
+- Batch Means CI for autocorrelated samples (Jain 25.5.2)
+- Paired comparison CI on differences (Jain 13.4.1)
+- Geometric mean speedup with CI in log-space (Jain 12.5)
+- Throughput uses harmonic mean (rates)
+- Sample size adequacy check (Jain 13.9) using CI precision
+- Per-service comparison tables + optional plots
 
 Usage:
-  python generate_unified_comparison_academic.py --data-dir ./results --run-id 20251213_123000
-  python generate_unified_comparison_academic.py --data-dir ./results --latest
+  python generate_unified_comparison_academic.py --data-dir ./results/capa_experiment
 """
 
 import os
 import math
-import json
 import glob
+import json
 import argparse
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
-import pandas as pd
-from scipy import stats
 
+# Optional plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from scipy import stats
+from collections import defaultdict
 
 # =============================================================================
 # DATA STRUCTURES
@@ -59,12 +49,12 @@ class ConfidenceInterval:
     ci_lower: float
     ci_upper: float
     ci_width: float
-    confidence_level: float
-    sample_size: int
+    confidence: float
+    n: int
     method: str
 
     def includes_zero(self) -> bool:
-        return self.ci_lower <= 0 <= self.ci_upper
+        return self.ci_lower <= 0.0 <= self.ci_upper
 
 
 @dataclass
@@ -73,489 +63,519 @@ class BatchMeansResult:
     batch_means: List[float]
     batch_size: int
     num_batches: int
-    variance_of_batch_means: float
-    autocovariance_lag1: float
+    var_batch_means: float
+    autocov_lag1: float
     ci: ConfidenceInterval
     is_valid: bool
     warning: Optional[str] = None
 
 
 @dataclass
-class PairedComparisonResult:
+class PairedComparison:
     metric: str
-    n: int
-
     baseline_mean: float
     capa_mean: float
-
-    mean_type: str
     improvement_pct: float
-
-    # paired difference baseline - capa
-    diff_mean: float
-    diff_ci_low: float
-    diff_ci_high: float
     p_value: float
     significant: bool
+    diff_ci: ConfidenceInterval
     effect_size_d: float
-
-    # speedup (baseline/capa) for time metrics
-    speedup_geo_mean: float
-    speedup_ci_low: float
-    speedup_ci_high: float
-
-    # precision check (Jain 13.9)
-    precision_halfwidth_over_mean: float
-    precision_target: float
-    adequate_precision: bool
-
-    metadata: Dict[str, Any]
+    notes: List[str]
 
 
 # =============================================================================
-# CORE STATISTICS
+# CORE STAT UTILS (Jain)
 # =============================================================================
 
-def compute_ci_naive(data: np.ndarray, confidence: float) -> ConfidenceInterval:
-    n = int(len(data))
+def compute_ci_naive(x: np.ndarray, confidence: float = 0.95, method: str = "naive") -> ConfidenceInterval:
+    x = np.asarray(x, dtype=float)
+    n = len(x)
     if n < 2:
-        return ConfidenceInterval(0, 0, 0, 0, 0, confidence, n, "naive_smallN")
-    x = float(np.mean(data))
-    s = float(np.std(data, ddof=1))
+        return ConfidenceInterval(0, 0, 0, 0, 0, confidence, n, method)
+    m = float(np.mean(x))
+    s = float(np.std(x, ddof=1))
     alpha = 1.0 - confidence
-    tval = float(stats.t.ppf(1 - alpha / 2, df=n - 1))
-    half = tval * s / math.sqrt(n)
-    return ConfidenceInterval(x, s, x - half, x + half, 2 * half, confidence, n, "naive")
+    tval = float(stats.t.ppf(1 - alpha/2, df=n-1))
+    hw = tval * s / math.sqrt(n)
+    return ConfidenceInterval(m, s, m-hw, m+hw, 2*hw, confidence, n, method)
 
 
-def batch_means_analysis(data: np.ndarray, confidence: float, initial_batch_size: int = 10) -> BatchMeansResult:
-    """
-    Jain 25.5.2 batch means for autocorrelated observations.
-    We increase batch size until lag-1 autocovariance is small relative to var.
-    """
-    data = np.asarray(data, dtype=float)
-    N = int(len(data))
+def batch_means_ci(x: np.ndarray, confidence: float = 0.95, initial_batch: int = 10) -> BatchMeansResult:
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+
     if N < 20:
-        ci = compute_ci_naive(data, confidence)
-        return BatchMeansResult(ci.mean, [ci.mean], N, 1, 0.0, 0.0, ci, False, "N<20")
+        ci = compute_ci_naive(x, confidence, method="naive_smallN")
+        return BatchMeansResult(ci.mean, [ci.mean], N, 1, 0.0, 0.0, ci, False, "N<20 (naive)")
 
-    batch_size = int(initial_batch_size)
-    best: Optional[BatchMeansResult] = None
+    batch = max(2, int(initial_batch))
+    best = None
 
     for _ in range(10):
-        m = N // batch_size
+        m = N // batch
         if m < 5:
             break
 
-        bmeans = [float(np.mean(data[i * batch_size:(i + 1) * batch_size])) for i in range(m)]
+        bmeans = [float(np.mean(x[i*batch:(i+1)*batch])) for i in range(m)]
         overall = float(np.mean(bmeans))
-        var_bm = float(np.var(bmeans, ddof=1))
+        var_bm = float(np.var(bmeans, ddof=1)) if m > 1 else 0.0
 
-        # lag-1 autocov of batch means
+        # lag-1 autocovariance of batch means
         acov = 0.0
-        if m >= 2 and var_bm > 0:
-            acov = sum((bmeans[i] - overall) * (bmeans[i + 1] - overall) for i in range(m - 1)) / (m - 1)
+        if m >= 2:
+            acov = sum((bmeans[i] - overall) * (bmeans[i+1] - overall) for i in range(m-1)) / (m-1)
 
         alpha = 1.0 - confidence
-        tval = float(stats.t.ppf(1 - alpha / 2, df=m - 1))
-        half = tval * math.sqrt(var_bm / m) if var_bm > 0 else 0.0
+        tval = float(stats.t.ppf(1 - alpha/2, df=m-1))
+        hw = tval * math.sqrt(var_bm / m) if m > 0 else 0.0
+        ci = ConfidenceInterval(overall, math.sqrt(var_bm), overall-hw, overall+hw, 2*hw, confidence, N, f"batch(n={batch})")
 
-        ci = ConfidenceInterval(
-            mean=overall,
-            std=math.sqrt(var_bm) if var_bm > 0 else 0.0,
-            ci_lower=overall - half,
-            ci_upper=overall + half,
-            ci_width=2 * half,
-            confidence_level=confidence,
-            sample_size=N,
-            method=f"batch(n={batch_size},m={m})",
-        )
-
-        is_valid = (var_bm == 0.0) or (abs(acov) < (0.1 * var_bm))
-        res = BatchMeansResult(overall, bmeans, batch_size, m, var_bm, acov, ci, is_valid)
+        # Jain-style heuristic: batch means should be "less autocorrelated"
+        is_valid = (var_bm > 0) and (abs(acov) < (0.1 * var_bm))
+        res = BatchMeansResult(overall, bmeans, batch, m, var_bm, acov, ci, is_valid)
         best = res
         if is_valid:
             return res
-        batch_size *= 2
 
-    if best is None:
-        ci = compute_ci_naive(data, confidence)
-        return BatchMeansResult(ci.mean, [ci.mean], N, 1, 0.0, 0.0, ci, False, "BM failed; fallback naive")
+        batch *= 2
 
-    best.warning = "High autocorrelation remained after max batch scaling"
-    return best
+    if best:
+        best.warning = "High autocorrelation remained after batch growth"
+        return best
 
-
-def remove_transient(data: np.ndarray, frac: float) -> Tuple[np.ndarray, int]:
-    """
-    Jain 25.3: discard transient. We use a conservative heuristic by default: first X%.
-    (You can replace with variance-based detection later; keep deterministic and transparent.)
-    """
-    data = np.asarray(data, dtype=float)
-    N = len(data)
-    if N < 50:
-        return data, 0
-    k = int(frac * N)
-    return data[k:], k
+    ci = compute_ci_naive(x, confidence, method="naive_fallback")
+    return BatchMeansResult(ci.mean, [ci.mean], N, 1, 0.0, 0.0, ci, False, "fallback")
 
 
-def harmonic_mean(values: np.ndarray) -> float:
-    v = np.asarray(values, dtype=float)
-    v = v[v > 0]
-    if len(v) == 0:
+def remove_transient_fixed_fraction(x: np.ndarray, frac: float = 0.10) -> Tuple[np.ndarray, int]:
+    x = np.asarray(x, dtype=float)
+    if len(x) < 50:
+        return x, 0
+    k = int(frac * len(x))
+    return x[k:], k
+
+
+def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+    n1, n2 = len(a), len(b)
+    if n1 < 2 or n2 < 2:
         return 0.0
-    return float(len(v) / np.sum(1.0 / v))
+    v1 = float(np.var(a, ddof=1))
+    v2 = float(np.var(b, ddof=1))
+    pooled = math.sqrt(((n1-1)*v1 + (n2-1)*v2) / (n1+n2-2)) if (n1+n2-2) > 0 else 0.0
+    return float((np.mean(a) - np.mean(b)) / pooled) if pooled > 0 else 0.0
 
 
-def geometric_mean(values: np.ndarray) -> float:
-    v = np.asarray(values, dtype=float)
-    v = v[v > 0]
-    if len(v) == 0:
-        return 0.0
-    return float(np.exp(np.mean(np.log(v))))
-
-
-def cohens_d_paired(b: np.ndarray, c: np.ndarray) -> float:
+def geometric_mean_ci_speedup(baseline: np.ndarray, capa: np.ndarray, confidence: float = 0.95) -> Tuple[float, ConfidenceInterval]:
     """
-    For paired designs, compute d on differences.
+    Speedup s_i = baseline_i / capa_i
+    Use geometric mean: exp(mean(log(s_i))) with CI in log-space (Jain 12.5).
     """
-    d = b - c
-    if len(d) < 2:
-        return 0.0
-    sd = float(np.std(d, ddof=1))
-    if sd <= 0:
-        return 0.0
-    return float(np.mean(d) / sd)
+    b = np.asarray(baseline, dtype=float)
+    c = np.asarray(capa, dtype=float)
+    n = min(len(b), len(c))
+    b, c = b[:n], c[:n]
 
-
-def precision_check(mean_est: float, ci_half_width: float, target: float) -> Tuple[float, bool]:
-    """
-    Jain 13.9: adequate if (halfwidth/mean) <= target.
-    """
-    if mean_est == 0:
-        return float("inf"), False
-    ratio = abs(ci_half_width) / abs(mean_est)
-    return float(ratio), bool(ratio <= target)
-
-
-def speedup_geo_with_ci(b: np.ndarray, c: np.ndarray, confidence: float) -> Tuple[float, float, float]:
-    """
-    Speedup ratios are multiplicative => geometric mean (Jain 12.5).
-    Compute CI in log-space:
-      s_i = b_i / c_i
-      log_s = log(s_i)
-      CI(log) => exp(CI)
-    """
-    b = np.asarray(b, dtype=float)
-    c = np.asarray(c, dtype=float)
+    # avoid division by zero and invalids
     mask = (b > 0) & (c > 0)
     s = b[mask] / c[mask]
     if len(s) < 2:
-        gm = geometric_mean(s)
-        return gm, gm, gm
+        return 0.0, ConfidenceInterval(0, 0, 0, 0, 0, confidence, len(s), "geo_speedup_insufficient")
 
-    log_s = np.log(s)
-    ci = compute_ci_naive(log_s, confidence)
-    gm = float(np.exp(ci.mean))
-    lo = float(np.exp(ci.ci_lower))
-    hi = float(np.exp(ci.ci_upper))
-    return gm, lo, hi
+    logs = np.log(s)
+    m = float(np.mean(logs))
+    sd = float(np.std(logs, ddof=1))
+    alpha = 1.0 - confidence
+    tval = float(stats.t.ppf(1 - alpha/2, df=len(logs)-1))
+    hw = tval * sd / math.sqrt(len(logs))
+
+    gm = float(np.exp(m))
+    ci_low = float(np.exp(m - hw))
+    ci_up = float(np.exp(m + hw))
+    ci = ConfidenceInterval(gm, sd, ci_low, ci_up, ci_up - ci_low, confidence, len(logs), "geo_speedup_logspace")
+    return gm, ci
+
+
+def harmonic_mean(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[x > 0]
+    if len(x) == 0:
+        return 0.0
+    return float(len(x) / np.sum(1.0 / x))
+
+
+def sample_size_adequacy(ci: ConfidenceInterval, desired_precision: float = 0.10,
+                         abs_threshold: float = 0.01) -> Tuple[bool, float]:
+    """
+    Jain 13.9: Check if CI half-width / |mean| <= desired_precision.
+    
+    For near-zero means (e.g., failure_rate ≈ 0), uses absolute CI width
+    instead of relative precision to avoid division by zero / inf.
+    
+    Args:
+        ci: Confidence interval result
+        desired_precision: Relative precision threshold (default 10%)
+        abs_threshold: Absolute CI half-width threshold for near-zero means
+    
+    Returns:
+        (adequate, current_precision) where precision is relative for
+        normal means, or absolute half-width for near-zero means.
+    """
+    half = ci.ci_width / 2.0
+    
+    # Handle near-zero means: use absolute width instead of relative
+    if abs(ci.mean) < 1e-6:
+        # For metrics like failure_rate that are often ~0,
+        # check if the CI is tight in absolute terms
+        adequate = (half < abs_threshold)
+        return adequate, half  # Return absolute width, not relative
+    
+    # Normal case: relative precision
+    prec = abs(half / ci.mean)
+    return (prec <= desired_precision), float(prec)
 
 
 # =============================================================================
-# LOADING + PAIRING
+# CSV LOADING
 # =============================================================================
 
-REQUIRED_COLS = [
-    "run_id", "run_type", "pattern", "step_idx", "tick", "service",
-    "latency_p95_ms", "latency_avg_ms", "arrival_rate_rps", "cpu_utilization"
-]
-
-def load_run(data_dir: str, run_id: str, run_type: str) -> pd.DataFrame:
-    pat = os.path.join(data_dir, f"{run_type}_raw_{run_id}.csv")
-    if not os.path.exists(pat):
-        raise FileNotFoundError(f"Missing file: {pat}")
-    df = pd.read_csv(pat)
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            raise ValueError(f"Column {c} missing in {pat}")
-    return df
-
-
-def find_latest_run_id(data_dir: str) -> str:
-    metas = sorted(glob.glob(os.path.join(data_dir, "run_metadata_*.json")))
-    if not metas:
-        raise FileNotFoundError("No run_metadata_*.json found")
-    latest = metas[-1]
-    base = os.path.basename(latest)
-    run_id = base.replace("run_metadata_", "").replace(".json", "")
-    return run_id
+def read_csv(path: str) -> List[Dict[str, Any]]:
+    rows = []
+    with open(path, "r") as f:
+        header = f.readline().strip().split(",")
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) != len(header):
+                # tolerate commas in notes by truncation
+                parts = parts[:len(header)]
+                parts += [""] * (len(header) - len(parts))
+            d = dict(zip(header, parts))
+            rows.append(d)
+    return rows
 
 
-def pair_by_key(
-    base_df: pd.DataFrame,
-    capa_df: pd.DataFrame,
-    metric_col: str,
-) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+def latest_two_runs(data_dir: str) -> Tuple[str, str]:
+    base = sorted(glob.glob(os.path.join(data_dir, "baseline_run_*.csv")))
+    capa = sorted(glob.glob(os.path.join(data_dir, "capa_run_*.csv")))
+    if not base or not capa:
+        raise FileNotFoundError("Missing baseline_run_*.csv or capa_run_*.csv in data-dir.")
+    return base[-1], capa[-1]
+
+
+def to_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def to_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+# =============================================================================
+# ALIGNMENT (PAIRED)
+# =============================================================================
+
+def align_pairs(baseline_rows: List[Dict[str, Any]],
+                capa_rows: List[Dict[str, Any]],
+                key_fields: Tuple[str, ...] = ("service","pattern","step_idx","tick")) -> Dict[str, Dict[str, np.ndarray]]:
     """
-    Pair by (pattern, step_idx, tick, service). Returns aligned arrays.
+    Produces per-service aligned arrays for metrics.
+    Key idea: align by (service, pattern, step_idx, tick) which is stable in runner.
+    Returns:
+      { service: { metric_name: np.array([... paired ...]) for baseline/capa } }
     """
-    key_cols = ["pattern", "step_idx", "tick", "service"]
-    b = base_df[key_cols + [metric_col]].copy()
-    c = capa_df[key_cols + [metric_col]].copy()
-    b = b.rename(columns={metric_col: "baseline"})
-    c = c.rename(columns={metric_col: "capa"})
+    # index baseline by key
+    idx_b = {}
+    for r in baseline_rows:
+        k = tuple(r.get(f, "") for f in key_fields)
+        idx_b[k] = r
 
-    merged = b.merge(c, on=key_cols, how="inner")
-    merged = merged.dropna(subset=["baseline", "capa"])
-    return merged["baseline"].to_numpy(dtype=float), merged["capa"].to_numpy(dtype=float), merged
+    per_service = defaultdict(lambda: defaultdict(list))
+
+    for r in capa_rows:
+        k = tuple(r.get(f, "") for f in key_fields)
+        b = idx_b.get(k)
+        if not b:
+            continue
+        svc = r.get("service", "unknown")
+
+        # metrics to compare
+        for metric in ["latency_p95_ms", "latency_avg_ms", "arrival_rate_rps", "cpu_utilization", "failure_rate"]:
+            per_service[svc][f"baseline_{metric}"].append(to_float(b.get(metric, 0)))
+            per_service[svc][f"capa_{metric}"].append(to_float(r.get(metric, 0)))
+
+    # to arrays
+    out = {}
+    for svc, d in per_service.items():
+        out[svc] = {}
+        for k, v in d.items():
+            out[svc][k] = np.asarray(v, dtype=float)
+    return out
 
 
 # =============================================================================
 # COMPARISON ENGINE
 # =============================================================================
 
-def compare_paired(
-    baseline: np.ndarray,
-    capa: np.ndarray,
-    metric: str,
-    metric_type: str,
-    confidence: float,
-    transient_frac: float,
-    precision_target: float,
-) -> PairedComparisonResult:
+def paired_test_with_batch_ci(b: np.ndarray, c: np.ndarray, confidence: float = 0.95) -> Tuple[float, bool, ConfidenceInterval]:
     """
-    Jain 13.4.1 paired comparison:
-      d_i = baseline_i - capa_i
-      CI(d) via batch means, significance by paired t-test.
-    Mean selection:
-      latency => arithmetic
-      throughput => harmonic (and "improvement" sign adjusted)
+    Jain 13.4.1: treat as paired differences d_i = b_i - c_i, build CI for mean difference.
+    Use batch means CI to handle autocorrelation of d.
     """
-    # transient removal on each series (same fraction). Then align by min length.
-    b2, k1 = remove_transient(baseline, transient_frac)
-    c2, k2 = remove_transient(capa, transient_frac)
-    n = min(len(b2), len(c2))
-    b2, c2 = b2[:n], c2[:n]
-
+    n = min(len(b), len(c))
     if n < 2:
-        return PairedComparisonResult(
-            metric=metric, n=n,
-            baseline_mean=float(np.mean(b2)) if n else 0.0,
-            capa_mean=float(np.mean(c2)) if n else 0.0,
-            mean_type="n/a", improvement_pct=0.0,
-            diff_mean=0.0, diff_ci_low=0.0, diff_ci_high=0.0,
-            p_value=1.0, significant=False, effect_size_d=0.0,
-            speedup_geo_mean=1.0, speedup_ci_low=1.0, speedup_ci_high=1.0,
-            precision_halfwidth_over_mean=float("inf"),
-            precision_target=precision_target,
-            adequate_precision=False,
-            metadata={"transient_removed": int(max(k1, k2))}
-        )
+        return 1.0, False, ConfidenceInterval(0,0,0,0,0,confidence,n,"insufficient")
 
-    # Mean selection
+    d = b[:n] - c[:n]
+    bm = batch_means_ci(d, confidence=confidence, initial_batch=10)
+    # p-value from paired t-test (note: assumes approx normality; CI is batch-based)
+    _, p = stats.ttest_rel(b[:n], c[:n])
+    sig = bool(p < 0.05 and (not bm.ci.includes_zero()))
+    return float(p), sig, bm.ci
+
+
+def improvement_pct(b_mean: float, c_mean: float, higher_is_better: bool) -> float:
+    if b_mean == 0:
+        return 0.0
+    if higher_is_better:
+        # improvement means CAPA higher
+        return float(((c_mean - b_mean) / b_mean) * 100.0)
+    else:
+        # improvement means CAPA lower
+        return float(((b_mean - c_mean) / b_mean) * 100.0)
+
+
+def summarize_metric(name: str, b: np.ndarray, c: np.ndarray, metric_type: str,
+                     confidence: float = 0.95, transient_frac: float = 0.10) -> PairedComparison:
+    """
+    Summarize a metric comparison between baseline and CAPA.
+    
+    Key fix: Transient removal uses the SAME absolute index for both arrays
+    to maintain paired alignment.
+    """
+    notes = []
+    
+    # Align to common length FIRST
+    n_common = min(len(b), len(c))
+    b = b[:n_common]
+    c = c[:n_common]
+    
+    # Transient removal: same absolute count for both (maintains pairing)
+    if n_common >= 50:
+        k = int(transient_frac * n_common)
+        b2 = b[k:]
+        c2 = c[k:]
+        notes.append(f"Removed {k} transient samples ({transient_frac*100:.0f}%)")
+    else:
+        b2 = b
+        c2 = c
+        k = 0
+    
+    n = len(b2)
+    if n < 20:
+        notes.append("N<20 after transient removal; batch-means validity may be weak.")
+
+    # Mean selection based on metric type (Jain ch. 12)
     if metric_type == "latency":
+        # Arithmetic mean for response times
         b_mean = float(np.mean(b2))
         c_mean = float(np.mean(c2))
-        mean_type = "Arithmetic (Time)"
-        improvement = ((b_mean - c_mean) / b_mean) * 100.0 if b_mean > 0 else 0.0
-        speed_gm, speed_lo, speed_hi = speedup_geo_with_ci(b2, c2, confidence)
+        higher_is_better = False
     elif metric_type == "throughput":
+        # Harmonic mean for rates (Jain 12.4)
         b_mean = harmonic_mean(b2)
         c_mean = harmonic_mean(c2)
-        mean_type = "Harmonic (Rate)"
-        # For throughput, higher is better: improvement is reversed
-        improvement = ((c_mean - b_mean) / b_mean) * 100.0 if b_mean > 0 else 0.0
-        # speedup concept not used; set to ratio of means (optional)
-        speed_gm, speed_lo, speed_hi = (c_mean / b_mean if b_mean > 0 else 1.0,) * 3
+        higher_is_better = True
     else:
         b_mean = float(np.mean(b2))
         c_mean = float(np.mean(c2))
-        mean_type = "Arithmetic"
-        improvement = ((b_mean - c_mean) / b_mean) * 100.0 if b_mean > 0 else 0.0
-        speed_gm, speed_lo, speed_hi = speedup_geo_with_ci(b2, c2, confidence)
+        higher_is_better = True
 
-    # Paired diffs
-    d = b2 - c2
-    bm = batch_means_analysis(d, confidence=confidence, initial_batch_size=10)
-    diff_mean = float(np.mean(d))
+    imp = improvement_pct(b_mean, c_mean, higher_is_better=higher_is_better)
+    p, sig, diff_ci = paired_test_with_batch_ci(b2, c2, confidence=confidence)
+    d = cohens_d(b2, c2)
 
-    # Paired t-test (for completeness). Primary decision is CI(d) includes zero or not.
-    _, p = stats.ttest_rel(b2, c2)
-
-    sig = (not (bm.ci.ci_lower <= 0 <= bm.ci.ci_upper)) and (p < 0.05)
-    eff = cohens_d_paired(b2, c2)
-
-    # Precision check on diffs CI
-    half_width = bm.ci.ci_width / 2.0
-    prec_ratio, ok = precision_check(bm.ci.mean, half_width, precision_target)
-
-    return PairedComparisonResult(
-        metric=metric,
-        n=n,
+    return PairedComparison(
+        metric=name,
         baseline_mean=b_mean,
         capa_mean=c_mean,
-        mean_type=mean_type,
-        improvement_pct=float(improvement),
-        diff_mean=diff_mean,
-        diff_ci_low=float(bm.ci.ci_lower),
-        diff_ci_high=float(bm.ci.ci_upper),
-        p_value=float(p),
-        significant=bool(sig),
-        effect_size_d=float(eff),
-        speedup_geo_mean=float(speed_gm),
-        speedup_ci_low=float(speed_lo),
-        speedup_ci_high=float(speed_hi),
-        precision_halfwidth_over_mean=float(prec_ratio),
-        precision_target=float(precision_target),
-        adequate_precision=bool(ok),
-        metadata={
-            "batch_valid": bool(bm.is_valid),
-            "batch_size": int(bm.batch_size),
-            "num_batches": int(bm.num_batches),
-            "autocov_lag1": float(bm.autocovariance_lag1),
-            "transient_removed_each": int(max(int(transient_frac * len(baseline)), int(transient_frac * len(capa)))),
-        },
+        improvement_pct=imp,
+        p_value=p,
+        significant=sig,
+        diff_ci=diff_ci,
+        effect_size_d=d,
+        notes=notes
     )
 
-
 # =============================================================================
-# REPORTING + PLOTS
+# REPORTING
 # =============================================================================
 
-def plot_box(output_dir: str, title: str, baseline: np.ndarray, capa: np.ndarray, fname: str):
-    os.makedirs(output_dir, exist_ok=True)
+def print_table(rows: List[List[str]], header: List[str]):
+    colw = [len(h) for h in header]
+    for r in rows:
+        for i, cell in enumerate(r):
+            colw[i] = max(colw[i], len(cell))
+    def fmt_row(r):
+        return " | ".join(r[i].ljust(colw[i]) for i in range(len(r)))
+    print(fmt_row(header))
+    print("-+-".join("-"*w for w in colw))
+    for r in rows:
+        print(fmt_row(r))
+
+
+def plot_box(out_dir: str, svc: str, metric: str, b: np.ndarray, c: np.ndarray):
+    os.makedirs(out_dir, exist_ok=True)
     plt.figure(figsize=(10, 6))
-    plt.boxplot([baseline, capa], labels=["Baseline", "CAPA+"], showfliers=False)
-    plt.title(title)
+    plt.boxplot([b, c], labels=["Baseline", "CAPA"])
+    plt.title(f"{svc}: {metric} (steady-state, after transient removal)")
     plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, fname))
+    plt.savefig(os.path.join(out_dir, f"{svc}_{metric}_box.png"))
     plt.close()
 
 
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
-    ap = argparse.ArgumentParser(description="Academic analysis for CAPA+ v3 CLEAN")
-    ap.add_argument("--data-dir", default="./results")
-    ap.add_argument("--run-id", default=None)
-    ap.add_argument("--latest", action="store_true")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", required=True, help="Directory containing baseline_run_*.csv and capa_run_*.csv")
     ap.add_argument("--output-dir", default="./analysis_output")
     ap.add_argument("--confidence", type=float, default=0.95)
     ap.add_argument("--transient-frac", type=float, default=0.10)
-    ap.add_argument("--precision-target", type=float, default=0.10)  # ±10% default
+    ap.add_argument("--precision", type=float, default=0.10, help="Desired CI half-width/mean threshold (Jain 13.9)")
+    ap.add_argument("--plots", action="store_true")
     args = ap.parse_args()
 
-    if args.latest or not args.run_id:
-        run_id = find_latest_run_id(args.data_dir)
-    else:
-        run_id = args.run_id
+    base_path, capa_path = latest_two_runs(args.data_dir)
+    print("="*70)
+    print("CAPA+ ACADEMIC COMPARISON REPORT (Jain 1991)")
+    print("="*70)
+    print(f"Baseline CSV: {os.path.basename(base_path)}")
+    print(f"CAPA CSV:     {os.path.basename(capa_path)}")
 
-    out_dir = args.output_dir
-    os.makedirs(out_dir, exist_ok=True)
+    baseline_rows = read_csv(base_path)
+    capa_rows = read_csv(capa_path)
 
-    base_df = load_run(args.data_dir, run_id, "baseline")
-    capa_df = load_run(args.data_dir, run_id, "capa")
+    aligned = align_pairs(baseline_rows, capa_rows)
 
-    # Metrics to analyze (extendable)
-    metrics = [
+    if not aligned:
+        print("No aligned paired observations found. Ensure both runs used same seed/patterns.")
+        return
+
+    # Global aggregate across services (concatenate)
+    global_metrics = defaultdict(list)
+    for svc, d in aligned.items():
+        for k, arr in d.items():
+            global_metrics[k].append(arr)
+    for k in list(global_metrics.keys()):
+        global_metrics[k] = np.concatenate(global_metrics[k]) if global_metrics[k] else np.array([])
+
+    # Metrics to analyze
+    metric_defs = [
         ("latency_p95_ms", "latency"),
         ("latency_avg_ms", "latency"),
         ("arrival_rate_rps", "throughput"),
         ("cpu_utilization", "other"),
+        ("failure_rate", "other"),
     ]
 
-    services = sorted(set(base_df["service"].unique()).intersection(set(capa_df["service"].unique())))
-    patterns = sorted(set(base_df["pattern"].unique()).intersection(set(capa_df["pattern"].unique())))
+    print("\n--- GLOBAL (All services pooled; interpret cautiously if latency is global aggregate) ---")
+    global_rows = []
+    for mname, mtype in metric_defs:
+        b = global_metrics.get(f"baseline_{mname}", np.array([]))
+        c = global_metrics.get(f"capa_{mname}", np.array([]))
+        if len(b) < 2 or len(c) < 2:
+            continue
+        res = summarize_metric(mname, b, c, mtype, confidence=args.confidence, transient_frac=args.transient_frac)
+        adequate, prec = sample_size_adequacy(res.diff_ci, desired_precision=args.precision)
+        global_rows.append([
+            mname,
+            f"{res.baseline_mean:.4f}",
+            f"{res.capa_mean:.4f}",
+            f"{res.improvement_pct:+.2f}%",
+            f"{res.p_value:.2e}",
+            "YES" if res.significant else "NO",
+            f"[{res.diff_ci.ci_lower:.4f},{res.diff_ci.ci_upper:.4f}]",
+            f"d={res.effect_size_d:.2f}",
+            f"prec={prec*100:.1f}% {'OK' if adequate else 'LOW'}"
+        ])
+    print_table(global_rows, ["Metric","Baseline","CAPA","Δ","p","Sig","CI(diff b-c)","Effect","CI precision"])
 
-    results_rows: List[Dict[str, Any]] = []
+    # Speedup on p95 latency (geometric mean)
+    b_p95 = global_metrics.get("baseline_latency_p95_ms", np.array([]))
+    c_p95 = global_metrics.get("capa_latency_p95_ms", np.array([]))
+    if len(b_p95) >= 2 and len(c_p95) >= 2:
+        # transient removal applied before speedup
+        b2, _ = remove_transient_fixed_fraction(b_p95, args.transient_frac)
+        c2, _ = remove_transient_fixed_fraction(c_p95, args.transient_frac)
+        gm, ci = geometric_mean_ci_speedup(b2, c2, confidence=args.confidence)
+        print("\n--- SPEEDUP (Geometric mean on latency_p95_ms; Jain 12.5) ---")
+        print(f"Speedup (Baseline/CAPA): {gm:.4f}x   CI[{ci.ci_lower:.4f}, {ci.ci_upper:.4f}]  (n={ci.n})")
 
-    # ---- System-level: pool across services by pairing key (service included) ----
-    print("=" * 78)
-    print(f"CAPA+ ACADEMIC REPORT (Jain 1991) | run_id={run_id}")
-    print("=" * 78)
-    print(f"Services: {len(services)} | Patterns: {len(patterns)}")
-    print(f"Confidence: {args.confidence:.2f} | Transient: {args.transient_frac:.0%} | Precision target: ±{args.precision_target:.0%}\n")
+    print("\n--- PER-SERVICE COMPARISON ---")
+    svc_rows = []
+    for svc, d in sorted(aligned.items()):
+        b = d.get("baseline_latency_p95_ms", np.array([]))
+        c = d.get("capa_latency_p95_ms", np.array([]))
+        if len(b) < 2 or len(c) < 2:
+            continue
+        res = summarize_metric("latency_p95_ms", b, c, "latency",
+                               confidence=args.confidence, transient_frac=args.transient_frac)
+        adequate, prec = sample_size_adequacy(res.diff_ci, desired_precision=args.precision)
+        svc_rows.append([
+            svc,
+            f"{len(b)}",
+            f"{res.baseline_mean:.2f}",
+            f"{res.capa_mean:.2f}",
+            f"{res.improvement_pct:+.2f}%",
+            f"{res.p_value:.2e}",
+            "YES" if res.significant else "NO",
+            f"[{res.diff_ci.ci_lower:.2f},{res.diff_ci.ci_upper:.2f}]",
+            f"{prec*100:.1f}%",
+            "OK" if adequate else "LOW"
+        ])
 
-    for metric_col, mtype in metrics:
-        b, c, merged = pair_by_key(base_df, capa_df, metric_col)
-        res = compare_paired(
-            b, c,
-            metric=metric_col,
-            metric_type=mtype,
-            confidence=args.confidence,
-            transient_frac=args.transient_frac,
-            precision_target=args.precision_target,
-        )
+        if args.plots:
+            # plot after transient
+            b2, _ = remove_transient_fixed_fraction(b, args.transient_frac)
+            c2, _ = remove_transient_fixed_fraction(c, args.transient_frac)
+            plot_box(args.output_dir, svc, "latency_p95_ms", b2, c2)
 
-        print(f"--- SYSTEM (pooled) | {metric_col} | {res.mean_type} ---")
-        print(f"n(paired after transient): {res.n}")
-        print(f"Baseline mean: {res.baseline_mean:.4f}")
-        print(f"CAPA+ mean:    {res.capa_mean:.4f}")
-        print(f"Improvement:   {res.improvement_pct:+.2f}%")
-        print(f"Diff (B-C):    {res.diff_mean:.4f}")
-        print(f"CI(diff):      [{res.diff_ci_low:.4f}, {res.diff_ci_high:.4f}]  (batch_valid={res.metadata['batch_valid']})")
-        print(f"p-value:       {res.p_value:.3e} | significant={res.significant}")
-        print(f"Effect size d: {res.effect_size_d:.3f}")
-        if mtype == "latency":
-            print(f"Speedup (geo): {res.speedup_geo_mean:.3f}x  CI=[{res.speedup_ci_low:.3f},{res.speedup_ci_high:.3f}]")
-        print(f"Precision:     halfwidth/mean={res.precision_halfwidth_over_mean:.3f}  adequate={res.adequate_precision}")
-        print()
+    print_table(
+        svc_rows,
+        ["Service","N","Base P95","CAPA P95","Δ","p","Sig","CI(diff b-c)","CI prec","Adeq"]
+    )
 
-        results_rows.append({
-            "scope": "system",
-            "service": "ALL",
-            **asdict(res),
-        })
+    # Save JSON report
+    os.makedirs(args.output_dir, exist_ok=True)
+    report = {
+        "baseline_csv": os.path.basename(base_path),
+        "capa_csv": os.path.basename(capa_path),
+        "confidence": args.confidence,
+        "transient_frac": args.transient_frac,
+        "global": global_rows,
+        "per_service": svc_rows,
+        "notes": [
+            "If Locust aggregate latency is used, latency is global and identical per service in the raw data.",
+            "Sequential paired runs are not the same as independent replications; for publication-grade results, run multiple replications and compare distributions."
+        ]
+    }
+    with open(os.path.join(args.output_dir, "academic_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
 
-        # plot (system)
-        if metric_col == "latency_p95_ms":
-            b2, _ = remove_transient(b, args.transient_frac)
-            c2, _ = remove_transient(c, args.transient_frac)
-            n = min(len(b2), len(c2))
-            plot_box(out_dir, "System P95 Latency (Steady-State)", b2[:n], c2[:n], "system_p95_latency_box.png")
-
-    # ---- Per-service strict comparison ----
-    for svc in services:
-        bsvc = base_df[base_df["service"] == svc]
-        csvc = capa_df[capa_df["service"] == svc]
-
-        for metric_col, mtype in metrics:
-            b, c, merged = pair_by_key(bsvc, csvc, metric_col)
-            res = compare_paired(
-                b, c,
-                metric=f"{metric_col}",
-                metric_type=mtype,
-                confidence=args.confidence,
-                transient_frac=args.transient_frac,
-                precision_target=args.precision_target,
-            )
-            results_rows.append({
-                "scope": "service",
-                "service": svc,
-                **asdict(res),
-            })
-
-        # plot per service for p95 latency
-        b, c, _ = pair_by_key(bsvc, csvc, "latency_p95_ms")
-        b2, _ = remove_transient(b, args.transient_frac)
-        c2, _ = remove_transient(c, args.transient_frac)
-        n = min(len(b2), len(c2))
-        if n >= 2:
-            plot_box(out_dir, f"{svc} P95 Latency (Steady-State)", b2[:n], c2[:n], f"{svc}_p95_latency_box.png")
-
-    # Save summary CSV
-    summary = pd.DataFrame(results_rows)
-    out_csv = os.path.join(out_dir, f"academic_summary_{run_id}.csv")
-    summary.to_csv(out_csv, index=False)
-
-    # Save JSON summary too
-    out_json = os.path.join(out_dir, f"academic_summary_{run_id}.json")
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(results_rows, f, indent=2, ensure_ascii=False)
-
-    print(f"Saved: {out_csv}")
-    print(f"Saved: {out_json}")
-    print(f"Figures: {out_dir}")
-
+    print(f"\nSaved report: {os.path.join(args.output_dir, 'academic_report.json')}")
+    if args.plots:
+        print(f"Saved plots into: {args.output_dir}")
 
 if __name__ == "__main__":
     main()
