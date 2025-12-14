@@ -521,7 +521,8 @@ def main():
         b2 = b_p95[k:n_common]
         c2 = c_p95[k:n_common]
         gm, ci = geometric_mean_ci_speedup(b2, c2, confidence=args.confidence)
-
+        print("\n--- SPEEDUP (Geometric mean on latency_p95_ms; Jain 12.5) ---")
+        print(f"Speedup (Baseline/CAPA): {gm:.4f}x   CI[{ci.ci_lower:.4f}, {ci.ci_upper:.4f}]  (n={ci.n})")
     print("\n--- PER-SERVICE COMPARISON ---")
     svc_rows = []
     for svc, d in sorted(aligned.items()):
