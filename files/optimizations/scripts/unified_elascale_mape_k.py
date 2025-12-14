@@ -579,13 +579,13 @@ class DoubleQAgent:
             json.dump(data, f, indent=2)
 
     def load(self, path: str) -> None:
-      with open(path, "r") as f:
-        data = json.load(f)
-      self.eps = float(data.get("eps", self.eps))
-      for k, v in data.get("qA", {}).items():
-        self.qA[ast.literal_eval(k)] = v  # Safe!
-      for k, v in data.get("qB", {}).items():
-        self.qB[ast.literal_eval(k)] = v  # Safe!
+        with open(path, "r") as f:
+          data = json.load(f)
+        self.eps = float(data.get("eps", self.eps))
+        for k, v in data.get("qA", {}).items():
+          self.qA[ast.literal_eval(k)] = v  # Safe!
+        for k, v in data.get("qB", {}).items():
+          self.qB[ast.literal_eval(k)] = v  # Safe!
 
 
 # =============================================================================
@@ -803,51 +803,49 @@ class CAPAController:
     def _is_settled(self, m: ServiceMetrics, target: int) -> bool:
         return m.ready_replicas >= (target - self.cfg.readiness_tolerance)
 
-    def _maybe_update_learning(self, service: str, m: ServiceMetrics,
-                           cur_state: Tuple[int,int,int,int,int],
-                           lat_ratio: float) -> float:
-      if not self.learning_enabled:
-          return 0.0
+    def _maybe_update_learning(self, service: str, m: ServiceMetrics, cur_state: Tuple[int,int,int,int,int], lat_ratio: float) -> float:
+        if not self.learning_enabled:
+            return 0.0
 
-      # Case A: settle pending scaling action
-      if service in self.pending:
-          pend = self.pending[service]
-          elapsed = time.time() - pend.start_time
-          settled = self._is_settled(m, pend.target_replicas)
-          timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
+        # Case A: settle pending scaling action
+        if service in self.pending:
+            pend = self.pending[service]
+            elapsed = time.time() - pend.start_time
+            settled = self._is_settled(m, pend.target_replicas)
+            timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
 
-          if settled or timed_out:
-              pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
-              r = self.reward.calc(
-                  lat_ratio=float(lat_ratio),
-                  cpu=float(m.cpu_utilization),
-                  action_being_rewarded=pend.prev_action,
-                  pods_ready_ratio=float(pods_ready_ratio),
-                  prev_prev_action=pend.prev_prev_action
-              )
-              self.agents[service].update(pend.prev_state, pend.prev_action, r, cur_state)
-              del self.pending[service]
-              return r
-          return 0.0  # Pending but not yet settled
+            if settled or timed_out:
+                pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
+                r = self.reward.calc(
+                    lat_ratio=float(lat_ratio),
+                    cpu=float(m.cpu_utilization),
+                    action_being_rewarded=pend.prev_action,
+                    pods_ready_ratio=float(pods_ready_ratio),
+                    prev_prev_action=pend.prev_prev_action
+                )
+                self.agents[service].update(pend.prev_state, pend.prev_action, r, cur_state)
+                del self.pending[service]
+                return r
+            return 0.0  # Pending but not yet settled
 
-      # Case B: no pending action
-      if service in self.prev_state and service in self.prev_action:
-          prev_state = self.prev_state[service]
-          prev_action = self.prev_action[service]
-          prev_prev = self.prev_prev_action.get(service)
+        # Case B: no pending action
+        if service in self.prev_state and service in self.prev_action:
+            prev_state = self.prev_state[service]
+            prev_action = self.prev_action[service]
+            prev_prev = self.prev_prev_action.get(service)
 
-          pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
-          r = self.reward.calc(
-              lat_ratio=float(lat_ratio),
-              cpu=float(m.cpu_utilization),
-              action_being_rewarded=prev_action,
-              pods_ready_ratio=float(pods_ready_ratio),
-              prev_prev_action=prev_prev
-          )
-          self.agents[service].update(prev_state, prev_action, r, cur_state)
-          return r
+            pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
+            r = self.reward.calc(
+                lat_ratio=float(lat_ratio),
+                cpu=float(m.cpu_utilization),
+                action_being_rewarded=prev_action,
+                pods_ready_ratio=float(pods_ready_ratio),
+                prev_prev_action=prev_prev
+            )
+            self.agents[service].update(prev_state, prev_action, r, cur_state)
+            return r
 
-      return 0.0
+        return 0.0
 
     def save_agents(self, directory: str):
         os.makedirs(directory, exist_ok=True)
@@ -1143,7 +1141,6 @@ class ExperimentRunner:
                                 str(rec.ready_replicas), str(rec.desired_replicas),
                                 rec.action, rec.baseline_action, rec.rl_action, rec.decision_source, f"{rec.reward:.6f}",
                                 rec.state, f"{rec.lat_ratio:.6f}", f"{rec.pod_ratio:.6f}", f"{rec.cpu_trend:.6f}", f"{rec.lat_trend:.6f}",
-                                str(int(rec.executed)),  # Add to row (1 or 0)
                                 m.latency_scope, m.latency_source, m.resource_source,
                                 rec.notes.replace(",", ";")
                             ]
