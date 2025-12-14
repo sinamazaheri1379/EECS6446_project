@@ -56,8 +56,12 @@ import numpy as np
 try:
     import requests
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
-    import requests
+    logger.error(
+        "Missing required dependency: requests\n"
+        "Install with: pip install requests\n"
+        "Or use: pip install -r requirements.txt"
+    )
+    sys.exit(1)
 
 
 # =============================================================================
@@ -748,7 +752,7 @@ class CAPAController:
         if latency_for_ratio > 0 and sc.target_latency_ms > 0:
             lat_ratio = latency_for_ratio / sc.target_latency_ms
         else:
-            lat_ratio = 1.0  # Neutral, not "excellent"
+            lat_ratio = 1.0  # Neutral
             latency_valid = False
         pod_ratio = (m.ready_replicas / sc.max_replicas) if sc.max_replicas > 0 else 0.0
 
@@ -820,8 +824,28 @@ class CAPAController:
             "latency_valid": latency_valid,  # ADD THIS
         }
 
-    def _is_settled(self, m: ServiceMetrics, target: int) -> bool:
-        return m.ready_replicas >= (target - self.cfg.readiness_tolerance)
+    # Replace _is_settled with action-aware version:
+    def _is_settled(self, m: ServiceMetrics, target: int, action: ScalingAction) -> bool:
+        """
+        Check if scaling action has settled.
+    
+        For SCALE_UP: ready >= target (pods are running)
+        For SCALE_DOWN: ready <= target AND desired == target (pods terminated)
+        """
+        tol = self.cfg.readiness_tolerance
+    
+        if action == ScalingAction.SCALE_UP:
+            # Pods should be ready
+            return m.ready_replicas >= (target - tol)
+    
+        elif action == ScalingAction.SCALE_DOWN:
+            # Pods should be terminated AND desired should match
+            return (m.ready_replicas <= (target + tol) and 
+                    m.desired_replicas == target)
+    
+        else:
+            # STAY is always "settled"
+            return True
 
     def _maybe_update_learning(self, service: str, m: ServiceMetrics, cur_state: Tuple[int,int,int,int,int], lat_ratio: float) -> float:
         if not self.learning_enabled:
@@ -831,7 +855,7 @@ class CAPAController:
         if service in self.pending:
             pend = self.pending[service]
             elapsed = time.time() - pend.start_time
-            settled = self._is_settled(m, pend.target_replicas, pend.prev_action)  # Updated for Issue #5
+            settled = self._is_settled(m, pend.target_replicas, pend.prev_action)
             timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
 
             if settled or timed_out:
@@ -1065,6 +1089,7 @@ class ExperimentRunner:
             "ready_replicas","desired_replicas",
             "action","baseline_action","rl_action","decision_source","reward",
             "state","lat_ratio","pod_ratio","cpu_trend","lat_trend",
+            "latency_valid",
             "latency_scope","latency_source","resource_source","notes"
         ]
         with open(csv_path, "w") as f:
@@ -1092,6 +1117,9 @@ class ExperimentRunner:
 
         tick = 0
         try:
+            # Open file ONCE at the start
+            csv_file = open(csv_path, "w", buffering=1)  # Line buffering
+            csv_file.write(",".join(header) + "\n")
             for pat in patterns:
                 if not self._running:
                     break
@@ -1161,17 +1189,21 @@ class ExperimentRunner:
                                 str(rec.ready_replicas), str(rec.desired_replicas),
                                 rec.action, rec.baseline_action, rec.rl_action, rec.decision_source, f"{rec.reward:.6f}",
                                 rec.state, f"{rec.lat_ratio:.6f}", f"{rec.pod_ratio:.6f}", f"{rec.cpu_trend:.6f}", f"{rec.lat_trend:.6f}",
+                                str(int(out.get("latency_valid", True))),  # Added for Issue #3
                                 m.latency_scope, m.latency_source, m.resource_source,
                                 rec.notes.replace(",", ";")
                             ]
-                            with open(csv_path, "a") as f:
-                                f.write(",".join(row) + "\n")
+                            # Write directly to open file handle
+                            csv_file.write(",".join(row) + "\n")
 
                         tick += 1
                         time.sleep(self.cfg.control_interval_sec)
 
         finally:
             self._running = False
+            # Close CSV file
+            if csv_file:
+                csv_file.close()
             if self.locust.is_available():
                 self.locust.stop()
 
