@@ -182,7 +182,7 @@ class PendingScale:
     start_time: float
     prev_state: Tuple[int, int, int, int, int]
     prev_action: ScalingAction
-    prev_prev_action: Optional[ScalingAction]
+    last_action_before: Optional[ScalingAction]  # Was: prev_prev_action (a_{t-1} for thrash check)
     target_replicas: int
 
 @dataclass
@@ -272,6 +272,11 @@ class LocustClient:
             return r.status_code == 200
         except Exception:
             return False
+    
+    def reset_cache(self):
+        """Clear cached stats to prevent leak between experiment runs."""
+        self._cache = {}
+        self._cache_ts = 0.0
 
 
 class PrometheusClient:
@@ -385,7 +390,9 @@ class UnifiedMetricsCollector:
         self.log.info(f"Prometheus available={self.prom_ok}")
 
     def reset(self):
+        """Reset all cached state for a fresh run."""
         self._smoothed.clear()
+        self.locust.reset_cache()  # ADD THIS LINE
 
     def _ema(self, service: str, m: ServiceMetrics) -> ServiceMetrics:
         if service not in self._smoothed:
@@ -598,7 +605,7 @@ class Reward:
     - SLA (latency ratio)
     - efficiency (cpu)
     - stability (readiness ratio)
-    - thrashing (compare prev_action vs prev_prev_action)
+    - thrashing (compare current action vs immediately previous action)
     """
     def __init__(self, weights: Tuple[float, float, float, float] = (0.45, 0.25, 0.15, 0.15)):
         self.w_sla, self.w_eff, self.w_stab, self.w_thr = weights
@@ -608,10 +615,13 @@ class Reward:
              cpu: float,
              action_being_rewarded: ScalingAction,
              pods_ready_ratio: float,
-             prev_prev_action: Optional[ScalingAction]) -> float:
+             last_action: Optional[ScalingAction],  # Was: prev_prev_action
+             latency_valid: bool = True) -> float:  # Added for issue #3
 
-        # 1) SLA
-        if lat_ratio <= 0.8: r_sla = 1.0
+        # 1) SLA - handle missing latency (Issue #3)
+        if not latency_valid:
+            r_sla = 0.0  # Neutral when data missing
+        elif lat_ratio <= 0.8: r_sla = 1.0
         elif lat_ratio <= 1.0: r_sla = 0.5
         elif lat_ratio <= 1.5: r_sla = -0.5
         elif lat_ratio <= 2.0: r_sla = -1.0
@@ -633,14 +643,17 @@ class Reward:
         else:
             r_stab = 0.1
 
-        # 4) Thrashing (fixed)
+        # 4) Thrashing: consecutive flip-flop (t vs t-1)
         r_thr = 0.0
-        if prev_prev_action is not None and action_being_rewarded != prev_prev_action:
-            # flip-flop UP <-> DOWN is the worst
-            if ((action_being_rewarded == ScalingAction.SCALE_UP and prev_prev_action == ScalingAction.SCALE_DOWN) or
-                (action_being_rewarded == ScalingAction.SCALE_DOWN and prev_prev_action == ScalingAction.SCALE_UP)):
+        if last_action is not None:
+            # UP immediately after DOWN, or DOWN immediately after UP
+            if ((action_being_rewarded == ScalingAction.SCALE_UP and last_action == ScalingAction.SCALE_DOWN) or
+                (action_being_rewarded == ScalingAction.SCALE_DOWN and last_action == ScalingAction.SCALE_UP)):
                 r_thr = -1.0
-            elif action_being_rewarded != ScalingAction.STAY:
+            # Any scaling after different scaling (less severe)
+            elif (action_being_rewarded != ScalingAction.STAY and 
+                  last_action != ScalingAction.STAY and 
+                  action_being_rewarded != last_action):
                 r_thr = -0.3
 
         r = self.w_sla * r_sla + self.w_eff * r_eff + self.w_stab * r_stab + self.w_thr * r_thr
@@ -665,7 +678,7 @@ class CAPAController:
         # State histories for correct RL updates
         self.prev_state: Dict[str, Tuple[int, int, int, int, int]] = {}
         self.prev_action: Dict[str, ScalingAction] = {}
-        self.prev_prev_action: Dict[str, Optional[ScalingAction]] = {}
+        self.last_action: Dict[str, Optional[ScalingAction]] = {}  # Was: prev_prev_action
 
         # Trends
         self.prev_metrics: Dict[str, ServiceMetrics] = {}
@@ -683,7 +696,7 @@ class CAPAController:
     def reset_state_for_new_run(self):
         self.prev_state.clear()
         self.prev_action.clear()
-        self.prev_prev_action.clear()
+        self.last_action.clear()  # Was: prev_prev_action
         self.prev_metrics.clear()
         self.prev_lat_ratio.clear()
         self.last_scale_time.clear()
@@ -727,9 +740,16 @@ class CAPAController:
         """
         sc = self.cfg.services[service]
         m = self.metrics.collect(service)
-
-        # ratios
-        lat_ratio = (m.latency_avg_ms / sc.target_latency_ms) if (m.latency_avg_ms > 0 and sc.target_latency_ms > 0) else 0.0
+        # Track whether latency data is valid
+        latency_valid = (m.latency_avg_ms > 0 or m.latency_p95_ms > 0)
+        # Use p95 if available, fallback to avg (Issue #8)
+        latency_for_ratio = m.latency_p95_ms if m.latency_p95_ms > 0 else m.latency_avg_ms
+        # Neutral ratio (1.0) when data missing instead of 0.0
+        if latency_for_ratio > 0 and sc.target_latency_ms > 0:
+            lat_ratio = latency_for_ratio / sc.target_latency_ms
+        else:
+            lat_ratio = 1.0  # Neutral, not "excellent"
+            latency_valid = False
         pod_ratio = (m.ready_replicas / sc.max_replicas) if sc.max_replicas > 0 else 0.0
 
         # trends
@@ -759,20 +779,20 @@ class CAPAController:
             source = "cooldown_block"
 
         executed = False
-        target_reps = m.ready_replicas
+        target_reps = m.desired_replicas  # Changed from m.ready_replicas
         if chosen != ScalingAction.STAY:
-            executed, target_reps = self._execute(service, chosen, m.ready_replicas, sc)
+            executed, target_reps = self._execute(service, chosen, m.desired_replicas, sc)
 
         # learning update:
         # 1) if there is pending settle, check settle/timeout and update for that previous scaling action
-        reward_value = self._maybe_update_learning(service, m, cur_state, lat_ratio)
+        reward_value = self._maybe_update_learning(service, m, cur_state, lat_ratio, latency_valid)
         # 2) if we executed scaling now, register pending settle with the action being rewarded later
         if executed and self.learning_enabled:
             self.pending[service] = PendingScale(
                 start_time=time.time(),
                 prev_state=cur_state,                    # state at time of action selection
                 prev_action=chosen,                      # action to be rewarded later
-                prev_prev_action=self.prev_action.get(service),  # for thrash compare (a_{t-2})
+                last_action_before=self.prev_action.get(service),  # Action at t-1
                 target_replicas=target_reps
             )
 
@@ -780,8 +800,7 @@ class CAPAController:
         self.prev_metrics[service] = m
         # track action history for thrashing:
         # prev_prev_action <= prev_action, prev_action <= chosen
-        old_prev = self.prev_action.get(service)
-        self.prev_prev_action[service] = old_prev
+        self.last_action[service] = self.prev_action.get(service)
         self.prev_action[service] = chosen
         self.prev_state[service] = cur_state
 
@@ -798,6 +817,7 @@ class CAPAController:
             "decision_source": source,
             "reward": reward_value,
             "executed": executed,
+            "latency_valid": latency_valid,  # ADD THIS
         }
 
     def _is_settled(self, m: ServiceMetrics, target: int) -> bool:
@@ -811,7 +831,7 @@ class CAPAController:
         if service in self.pending:
             pend = self.pending[service]
             elapsed = time.time() - pend.start_time
-            settled = self._is_settled(m, pend.target_replicas)
+            settled = self._is_settled(m, pend.target_replicas, pend.prev_action)  # Updated for Issue #5
             timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
 
             if settled or timed_out:
@@ -821,26 +841,26 @@ class CAPAController:
                     cpu=float(m.cpu_utilization),
                     action_being_rewarded=pend.prev_action,
                     pods_ready_ratio=float(pods_ready_ratio),
-                    prev_prev_action=pend.prev_prev_action
+                    last_action=pend.last_action_before,
+                    latency_valid=latency_valid  # ADD THIS
                 )
                 self.agents[service].update(pend.prev_state, pend.prev_action, r, cur_state)
                 del self.pending[service]
                 return r
-            return 0.0  # Pending but not yet settled
-
+            return 0.0
         # Case B: no pending action
         if service in self.prev_state and service in self.prev_action:
             prev_state = self.prev_state[service]
             prev_action = self.prev_action[service]
-            prev_prev = self.prev_prev_action.get(service)
-
+            last_act = self.last_action.get(service)
             pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
             r = self.reward.calc(
-                lat_ratio=float(lat_ratio),
-                cpu=float(m.cpu_utilization),
-                action_being_rewarded=prev_action,
-                pods_ready_ratio=float(pods_ready_ratio),
-                prev_prev_action=prev_prev
+              lat_ratio=float(lat_ratio),
+              cpu=float(m.cpu_utilization),
+              action_being_rewarded=prev_action,
+              pods_ready_ratio=float(pods_ready_ratio),
+              last_action=last_act,
+              latency_valid=latency_valid  # ADD THIS
             )
             self.agents[service].update(prev_state, prev_action, r, cur_state)
             return r
@@ -912,7 +932,7 @@ class BaselineController:
             source = "cooldown_block"
     
         if action != ScalingAction.STAY:
-            executed, _ = self._execute(service, action, m.ready_replicas, sc)
+            executed, _ = self._execute(service, action, m.desired_replicas, sc)
             if not executed:
                 source = "execute_failed"  # Optional: track failures
     
