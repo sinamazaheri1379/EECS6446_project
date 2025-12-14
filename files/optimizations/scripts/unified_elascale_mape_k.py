@@ -807,8 +807,8 @@ class CAPAController:
     def _maybe_update_learning(self, service: str, m: ServiceMetrics,
                            cur_state: Tuple[int,int,int,int,int],
                            lat_ratio: float) -> float:
-    if not self.learning_enabled:
-        return 0.0
+        if not self.learning_enabled:
+          return 0.0
       
         # Case A: settle pending scaling action
         if service in self.pending:
