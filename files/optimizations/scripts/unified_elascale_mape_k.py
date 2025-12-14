@@ -53,6 +53,14 @@ from collections import defaultdict
 
 import numpy as np
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("capa_unified_v3.log")]
+)
+logger = logging.getLogger("CAPA+v3_clean")
+
+
 try:
     import requests
 except ImportError:
@@ -62,20 +70,6 @@ except ImportError:
         "Or use: pip install -r requirements.txt"
     )
     sys.exit(1)
-
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
-    handlers=[logging.StreamHandler(), logging.FileHandler("capa_unified_v3.log")]
-)
-logger = logging.getLogger("CAPA+v3_clean")
-
 
 # =============================================================================
 # CONFIG
@@ -591,12 +585,12 @@ class DoubleQAgent:
 
     def load(self, path: str) -> None:
         with open(path, "r") as f:
-          data = json.load(f)
+            data = json.load(f)
         self.eps = float(data.get("eps", self.eps))
         for k, v in data.get("qA", {}).items():
-          self.qA[ast.literal_eval(k)] = v  # Safe!
+            self.qA[ast.literal_eval(k)] = v  # Safe!
         for k, v in data.get("qB", {}).items():
-          self.qB[ast.literal_eval(k)] = v  # Safe!
+            self.qB[ast.literal_eval(k)] = v  # Safe!
 
 
 # =============================================================================
@@ -847,7 +841,7 @@ class CAPAController:
             # STAY is always "settled"
             return True
 
-    def _maybe_update_learning(self, service: str, m: ServiceMetrics, cur_state: Tuple[int,int,int,int,int], lat_ratio: float) -> float:
+    def _maybe_update_learning(self, service: str, m: ServiceMetrics, cur_state: Tuple[int,int,int,int,int], lat_ratio: float, latency_valid: bool = True) -> float:
         if not self.learning_enabled:
             return 0.0
 
@@ -945,7 +939,8 @@ class BaselineController:
     def step(self, service: str) -> Dict[str, Any]:
         sc = self.cfg.services[service]
         m = self.metrics.collect(service)
-        lat_ratio = (m.latency_avg_ms / sc.target_latency_ms) if (m.latency_avg_ms > 0 and sc.target_latency_ms > 0) else 0.0
+        latency_valid = (m.latency_avg_ms > 0 or m.latency_p95_ms > 0)
+        lat_ratio = (m.latency_avg_ms / sc.target_latency_ms) if (m.latency_avg_ms > 0 and sc.target_latency_ms > 0) else 1.0  # Changed from 0.0 to 1.0
         pod_ratio = (m.ready_replicas / sc.max_replicas) if sc.max_replicas > 0 else 0.0
         action = self.hpa.decide(service, m.cpu_utilization, m.ready_replicas)
         source = "baseline_hpa"
@@ -973,6 +968,7 @@ class BaselineController:
             "decision_source": source,
             "reward": 0.0,
             "executed": executed,  # Add this to output
+            "latency_valid": latency_valid,  # ADD THIS
         }
 
 
@@ -1092,8 +1088,6 @@ class ExperimentRunner:
             "latency_valid",
             "latency_scope","latency_source","resource_source","notes"
         ]
-        with open(csv_path, "w") as f:
-            f.write(",".join(header) + "\n")
 
         meta = {
             "run_id": run_id,
@@ -1116,6 +1110,7 @@ class ExperimentRunner:
         self._stop_reason = ""
 
         tick = 0
+        csv_file = None
         try:
             # Open file ONCE at the start
             csv_file = open(csv_path, "w", buffering=1)  # Line buffering
