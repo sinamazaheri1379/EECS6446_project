@@ -765,9 +765,7 @@ class CAPAController:
 
         # learning update:
         # 1) if there is pending settle, check settle/timeout and update for that previous scaling action
-        reward_value = 0.0
-        self._maybe_update_learning(service, m, cur_state, lat_ratio)
-
+        reward_value = self._maybe_update_learning(service, m, cur_state, lat_ratio)
         # 2) if we executed scaling now, register pending settle with the action being rewarded later
         if executed and self.learning_enabled:
             self.pending[service] = PendingScale(
@@ -799,6 +797,7 @@ class CAPAController:
             "action": chosen,
             "decision_source": source,
             "reward": reward_value,
+            "executed": executed,
         }
 
     def _is_settled(self, m: ServiceMetrics, target: int) -> bool:
@@ -807,50 +806,48 @@ class CAPAController:
     def _maybe_update_learning(self, service: str, m: ServiceMetrics,
                            cur_state: Tuple[int,int,int,int,int],
                            lat_ratio: float) -> float:
-        if not self.learning_enabled:
+      if not self.learning_enabled:
           return 0.0
-      
-        # Case A: settle pending scaling action
-        if service in self.pending:
-            pend = self.pending[service]
-            elapsed = time.time() - pend.start_time
-            settled = self._is_settled(m, pend.target_replicas)
-            timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
 
-            if settled or timed_out:
-                pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
-                r = self.reward.calc(
-                    lat_ratio=float(lat_ratio),
-                    cpu=float(m.cpu_utilization),
-                    action_being_rewarded=pend.prev_action,
-                    pods_ready_ratio=float(pods_ready_ratio),
-                    prev_prev_action=pend.prev_prev_action
-                )
-                # FIX: Q-update uses correct prev_state for that action -> next_state is current_state
-                self.agents[service].update(pend.prev_state, pend.prev_action, r, cur_state)
-                del self.pending[service]
-            return r
+      # Case A: settle pending scaling action
+      if service in self.pending:
+          pend = self.pending[service]
+          elapsed = time.time() - pend.start_time
+          settled = self._is_settled(m, pend.target_replicas)
+          timed_out = elapsed >= self.cfg.scaling_settle_timeout_sec
 
-        # Case B: no pending action:
-        # We can optionally learn from STAY decisions too, but to keep semantics clean,
-        # we only learn when we have a previous (state, action) pair.
-        if service in self.prev_state and service in self.prev_action:
-            prev_state = self.prev_state[service]
-            prev_action = self.prev_action[service]
-            prev_prev = self.prev_prev_action.get(service)
+          if settled or timed_out:
+              pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
+              r = self.reward.calc(
+                  lat_ratio=float(lat_ratio),
+                  cpu=float(m.cpu_utilization),
+                  action_being_rewarded=pend.prev_action,
+                  pods_ready_ratio=float(pods_ready_ratio),
+                  prev_prev_action=pend.prev_prev_action
+              )
+              self.agents[service].update(pend.prev_state, pend.prev_action, r, cur_state)
+              del self.pending[service]
+              return r
+          return 0.0  # Pending but not yet settled
 
-            pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
-            r = self.reward.calc(
-                lat_ratio=float(lat_ratio),
-                cpu=float(m.cpu_utilization),
-                action_being_rewarded=prev_action,
-                pods_ready_ratio=float(pods_ready_ratio),
-                prev_prev_action=prev_prev
-            )
-            # FIX: correct (prev_state, prev_action) -> cur_state
-            self.agents[service].update(prev_state, prev_action, r, cur_state)
-            return r
-        return 0.0
+      # Case B: no pending action
+      if service in self.prev_state and service in self.prev_action:
+          prev_state = self.prev_state[service]
+          prev_action = self.prev_action[service]
+          prev_prev = self.prev_prev_action.get(service)
+
+          pods_ready_ratio = (m.ready_replicas / max(1, m.current_replicas))
+          r = self.reward.calc(
+              lat_ratio=float(lat_ratio),
+              cpu=float(m.cpu_utilization),
+              action_being_rewarded=prev_action,
+              pods_ready_ratio=float(pods_ready_ratio),
+              prev_prev_action=prev_prev
+          )
+          self.agents[service].update(prev_state, prev_action, r, cur_state)
+          return r
+
+      return 0.0
 
     def save_agents(self, directory: str):
         os.makedirs(directory, exist_ok=True)
@@ -911,7 +908,7 @@ class BaselineController:
         action = self.hpa.decide(service, m.cpu_utilization, m.ready_replicas)
         source = "baseline_hpa"
         executed = False  # Track execution status
-    
+        
         if action != ScalingAction.STAY and not self._can_scale(service):
             action = ScalingAction.STAY
             source = "cooldown_block"
@@ -1140,6 +1137,7 @@ class ExperimentRunner:
                             row = [
                                 rec.run_id, rec.mode, str(rec.seed), rec.pattern, str(rec.users), str(rec.step_idx),
                                 str(rec.tick), f"{rec.timestamp:.6f}", rec.service,
+                                str(int(rec.executed)),  # Move here to match header position!
                                 f"{rec.latency_p95_ms:.6f}", f"{rec.latency_avg_ms:.6f}", f"{rec.arrival_rate_rps:.6f}",
                                 f"{rec.cpu_utilization:.6f}", f"{rec.failure_rate:.6f}",
                                 str(rec.ready_replicas), str(rec.desired_replicas),
