@@ -1065,6 +1065,10 @@ class ExperimentRunner:
         if mode == ControlMode.CAPA and capa_checkpoint_in:
             logger.info(f"Loading CAPA agents from: {capa_checkpoint_in}")
             self.capa_ctrl.load_agents(capa_checkpoint_in)
+            if not capa_learning:
+                logger.info("Evaluation mode: setting epsilon=0 for pure exploitation")
+                for agent in self.capa_ctrl.agents.values():
+                      agent.eps = 0.0
 
         if mode == ControlMode.CAPA:
             self.capa_ctrl.set_learning(capa_learning)
